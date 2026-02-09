@@ -75,10 +75,80 @@ class TradingBot:
         # System event handler
         self.event_bus.subscribe(EventType.RISK_BREACH, self._on_risk_breach)
 
+        # Trade journal — logs every bar and trade for post-session review
+        self._journal_bars: list = []      # All bars received
+        self._journal_signals: list = []   # All signals/trades
+        self._session_start = datetime.now()
+        self._journal_active = False
+
+        # Subscribe to fills to log trades
+        self.event_bus.subscribe(EventType.FILL, self._on_fill_journal)
+
     def _on_risk_breach(self, event: Event):
         logger.warning(f"RISK BREACH: {event.data.get('reason', 'Unknown')}")
         if event.data.get("action") == "HALT":
             logger.error("Trading HALTED due to risk breach!")
+
+    def _on_fill_journal(self, event):
+        """Log every fill to the trade journal."""
+        if not self._journal_active:
+            return
+        self._journal_signals.append({
+            "timestamp": str(datetime.now()),
+            "symbol": event.symbol,
+            "type": "buy" if event.side.value == "BUY" else "sell",
+            "price": float(event.fill_price),
+            "quantity": int(event.quantity),
+            "reason": event.strategy_name or "",
+        })
+        logger.info(f"  📝 TRADE LOGGED: {event.side.value} {event.quantity} {event.symbol} @ ${event.fill_price:.2f}")
+
+    def _journal_bar(self, symbol: str, opn: float, high: float, low: float, close: float, volume: float):
+        """Log a bar to the journal for post-session replay."""
+        if not self._journal_active:
+            return
+        self._journal_bars.append({
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "open": round(opn, 4),
+            "high": round(high, 4),
+            "low": round(low, 4),
+            "close": round(close, 4),
+            "volume": int(volume),
+        })
+
+    def _log_bos_diagnostics(self):
+        """Log BOS strategy diagnostics (structure, position, pending signals)."""
+        diag = self.strategy.get_diagnostics()
+        if not isinstance(diag, dict):
+            return
+
+        for symbol in self._get_strategy_symbols():
+            sym_diag = diag.get(symbol, diag) if symbol in diag else diag
+            if not isinstance(sym_diag, dict):
+                continue
+
+            trend = sym_diag.get("trend", "?")
+            bos = sym_diag.get("bos", "none")
+            hh = sym_diag.get("hh", 0)
+            hl = sym_diag.get("hl", 0)
+            lh = sym_diag.get("lh", 0)
+            ll = sym_diag.get("ll", 0)
+            pos = sym_diag.get("in_position", "none")
+            pending = sym_diag.get("pending_entry", False)
+
+            trend_icon = "🟢" if trend == "bullish" else "🔴" if trend == "bearish" else "⚪"
+            parts = [f"{trend_icon} {symbol}: {trend.upper()}"]
+            parts.append(f"HH:{hh} HL:{hl} LH:{lh} LL:{ll}")
+
+            if bos and bos != "none":
+                parts.append(f"⚡ {bos.upper()}")
+            if pos and pos != "none":
+                parts.append(f"POS: {pos}")
+            if pending:
+                parts.append("⏳ WAITING PULLBACK")
+
+            logger.info(f"       {' | '.join(parts)}")
 
     def _get_strategy_symbols(self) -> set:
         """Extract symbols from strategy params."""
@@ -177,6 +247,8 @@ class TradingBot:
         logger.info(f"Polling {symbols} every {poll_interval}s. Ctrl+C to stop.\n")
 
         self._running = True
+        self._journal_active = True
+        self._session_start = datetime.now()
         poll_count = 0
         last_prices = {}
 
@@ -201,18 +273,18 @@ class TradingBot:
                         continue
 
                     last_prices[symbol] = price
+                    opn = float(latest["Open"])
+                    high = float(latest["High"])
+                    low = float(latest["Low"])
+                    vol = float(latest.get("Volume", 0))
 
                     event = MarketDataEvent(
                         symbol=symbol,
-                        open=float(latest["Open"]),
-                        high=float(latest["High"]),
-                        low=float(latest["Low"]),
-                        close=price,
-                        volume=float(latest.get("Volume", 0)),
-                        bar_timestamp=now,
-                        timestamp=now,
+                        open=opn, high=high, low=low, close=price,
+                        volume=vol, bar_timestamp=now, timestamp=now,
                     )
                     self.event_bus.publish(event)
+                    self._journal_bar(symbol, opn, high, low, price, vol)
 
                 except Exception as e:
                     logger.warning(f"Fetch failed for {symbol}: {e}")
@@ -240,13 +312,8 @@ class TradingBot:
                 f"DD: {risk_status['total_drawdown']:.2%}"
             )
 
-            # Log strategy diagnostics (compact)
-            diag = self.strategy.get_diagnostics()
-            if isinstance(diag, dict):
-                z = diag.get("z_score")
-                if z is not None:
-                    logger.info(f"       z={z:.3f} | hedge={diag.get('hedge_ratio', '?'):.4f} | "
-                                f"side={diag.get('position_side', 'none')}")
+            # BOS diagnostics
+            self._log_bos_diagnostics()
 
             # Wait
             try:
@@ -254,7 +321,9 @@ class TradingBot:
             except KeyboardInterrupt:
                 break
 
+        self._journal_active = False
         self._print_session_summary()
+        self._export_session_report()
 
     # ================================================================
     #  MODE 2: PAPER - Live trading via IBKR TWS (delayed data, free)
@@ -388,6 +457,8 @@ class TradingBot:
             ib.sleep(2)
 
             self._running = True
+            self._journal_active = True
+            self._session_start = datetime.now()
             logger.info(f"\nPaper trading live. Polling every {poll_interval}s. Ctrl+C to stop.\n")
             poll_count = 0
             last_prices = {}
@@ -432,6 +503,7 @@ class TradingBot:
                         volume=vol, bar_timestamp=now, timestamp=now,
                     )
                     self.event_bus.publish(event)
+                    self._journal_bar(symbol, opn, high, low, price, vol)
 
                 # Process all events
                 self.event_bus.process_all()
@@ -453,10 +525,8 @@ class TradingBot:
 
                 diag = self.strategy.get_diagnostics()
                 if isinstance(diag, dict):
-                    z = diag.get("z_score")
-                    if z is not None:
-                        logger.info(f"       z={z:.3f} | hedge={diag.get('hedge_ratio', '?'):.4f} | "
-                                    f"side={diag.get('position_side', 'none')}")
+                    # BOS strategy diagnostics
+                    self._log_bos_diagnostics()
 
                 # Wait
                 try:
@@ -482,7 +552,9 @@ class TradingBot:
                         pass
                 ib.disconnect()
                 logger.info("Disconnected from IBKR.")
+            self._journal_active = False
             self._print_session_summary()
+            self._export_session_report()
 
     # ================================================================
     #  MODE 3: BACKTEST
@@ -521,6 +593,7 @@ class TradingBot:
         print("\n" + "=" * 60)
         print("  SESSION SUMMARY")
         print("=" * 60)
+        print(f"  Duration:         {datetime.now() - self._session_start}")
         print(f"  Initial Capital:  ${self.portfolio.initial_capital:>14,.2f}")
         print(f"  Final Value:      ${self.portfolio.total_value:>14,.2f}")
         print(f"  Total Return:      {self.portfolio.total_return:>14.2%}")
@@ -528,10 +601,11 @@ class TradingBot:
         print(f"  Sharpe Ratio:      {metrics.get('sharpe_ratio', 0):>14.3f}")
         print(f"  Total Trades:      {len(self.portfolio.trade_log):>14d}")
         print(f"  Total Commission: ${self.portfolio.total_commission:>14,.2f}")
+        print(f"  Bars Received:     {len(self._journal_bars):>14d}")
 
         if not trades_df.empty:
             print(f"\n  Recent trades:")
-            for _, t in trades_df.tail(5).iterrows():
+            for _, t in trades_df.tail(10).iterrows():
                 print(f"    {t['side']:>4} {t['quantity']:>5} {t['symbol']:<6} "
                       f"@ ${t['price']:>10,.2f}  ({t['strategy']})")
 
@@ -544,6 +618,124 @@ class TradingBot:
                       f"PnL: ${pos.total_pnl:+,.2f}")
 
         print("=" * 60)
+
+    def _export_session_report(self):
+        """Export the live/paper session as a JSON report for the visualizer.
+
+        This lets you replay exactly what happened during paper trading,
+        see where trades were executed, and review your strategy's decisions.
+        """
+        import json
+
+        if not self._journal_bars:
+            print("  No bars logged — nothing to export.")
+            return
+
+        symbols = list(self._get_strategy_symbols())
+
+        # Build per-symbol bar arrays
+        bars_by_symbol = {}
+        for bar in self._journal_bars:
+            sym = bar["symbol"]
+            if sym not in bars_by_symbol:
+                bars_by_symbol[sym] = []
+            bars_by_symbol[sym].append({
+                "date": bar["date"],
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar["volume"],
+            })
+
+        # Use first symbol as primary
+        primary_sym = symbols[0] if symbols else list(bars_by_symbol.keys())[0]
+        primary_bars = bars_by_symbol.get(primary_sym, [])
+
+        # Map signals to bar indices
+        signals_with_idx = []
+        for sig in self._journal_signals:
+            sym = sig.get("symbol", primary_sym)
+            sym_bars = bars_by_symbol.get(sym, primary_bars)
+            # Find closest bar by timestamp
+            best_idx = len(sym_bars) - 1
+            for i, b in enumerate(sym_bars):
+                if b["date"] >= sig["timestamp"]:
+                    best_idx = i
+                    break
+            signals_with_idx.append({
+                "index": best_idx,
+                "symbol": sym,
+                "type": sig["type"],
+                "price": sig["price"],
+                "quantity": sig.get("quantity", 0),
+                "reason": sig.get("reason", ""),
+                "timestamp": sig["timestamp"],
+            })
+
+        # Pair trades for PnL
+        paired = []
+        open_pos = {}
+        for sig in signals_with_idx:
+            sym = sig["symbol"]
+            if sym not in open_pos:
+                open_pos[sym] = sig
+            else:
+                entry = open_pos.pop(sym)
+                is_long = entry["type"] == "buy"
+                pnl = (sig["price"] - entry["price"]) if is_long else (entry["price"] - sig["price"])
+                pnl_pct = pnl / entry["price"] * 100
+                paired.append({
+                    "symbol": sym,
+                    "direction": "LONG" if is_long else "SHORT",
+                    "entry_time": entry["timestamp"],
+                    "entry_price": entry["price"],
+                    "exit_time": sig["timestamp"],
+                    "exit_price": sig["price"],
+                    "quantity": entry.get("quantity", 0),
+                    "net_pnl": round(pnl * entry.get("quantity", 1), 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "duration": "",
+                    "win": pnl > 0,
+                })
+
+        # Build equity curve
+        equity_curve = []
+        history = self.portfolio.get_history_df()
+        if not history.empty:
+            for ts, row in history.iterrows():
+                equity_curve.append({
+                    "timestamp": str(ts),
+                    "value": round(float(row["total_value"]), 2),
+                    "drawdown": round(float(row.get("drawdown", 0)), 4),
+                })
+
+        session_type = "paper" if self.execution.__class__.__name__ == "IBKRExecution" else "simulate"
+        report = {
+            "meta": {
+                "symbols": symbols,
+                "interval": "live",
+                "start": str(self._session_start),
+                "end": str(datetime.now()),
+                "strategies": [self.strategy_name],
+                "session_type": session_type,
+                "generated_at": datetime.now().isoformat(),
+            },
+            "metrics": self.portfolio.calculate_metrics(),
+            "bars": bars_by_symbol,
+            "signals": signals_with_idx,
+            "paired_trades": paired,
+            "equity_curve": equity_curve,
+        }
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"./{session_type}_report_{timestamp}.json"
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+
+        print(f"\n  📊 Session report saved: {path}")
+        print(f"  To visualize: python visualizer.py --report {path}")
+        print()
 
     def stop(self):
         self._running = False
