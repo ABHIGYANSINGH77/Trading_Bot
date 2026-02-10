@@ -1,25 +1,30 @@
-"""Moving Average Crossover Strategy with Volatility Regime Filter.
+"""Moving Average Crossover Strategy — Long AND Short.
 
-Combines trend following (MA crossover) with regime detection
-(high/low volatility) to adapt position sizing.
+Always-in-market trend following:
+  Fast MA > Slow MA  →  be LONG
+  Fast MA < Slow MA  →  be SHORT
 
-In low-vol regimes:  Full size, standard MA crossover
-In high-vol regimes: Half size or skip trades
+Position flips take 2 bars for safety (exit bar + entry bar) because
+the event queue processes signals before fills resolve. Sending EXIT + ENTRY
+on the same bar causes the entry to be sized incorrectly.
 
-Works on any timeframe — volatility annualization adapts to interval.
+Volatility regime scales position size:
+  Low vol  → full size (strength=1.0)
+  High vol → half size (strength=0.5)
 """
 
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import numpy as np
 
-from core.events import EventBus, SignalEvent, SignalType
+from core.events import EventBus, EventType, MarketDataEvent, SignalEvent, SignalType
 
-
-# Bars per trading day for each interval (US equity: 6.5hr/day)
 _BARS_PER_DAY = {
-    "1m": 390, "5m": 78, "15m": 26, "30m": 13,
-    "1h": 7, "4h": 2, "1d": 1, "1wk": 0.2,
+    "1m": 390, "2m": 195, "3m": 130,
+    "5m": 78, "10m": 39, "15m": 26,
+    "20m": 20, "30m": 13,
+    "1h": 7, "2h": 3, "3h": 2, "4h": 2, "8h": 1,
+    "1d": 1, "1wk": 0.2,
 }
 
 def _bars_per_year(interval: str) -> float:
@@ -27,66 +32,49 @@ def _bars_per_year(interval: str) -> float:
 
 
 class MACrossoverStrategy:
-    """MA Crossover with volatility regime filter.
-
-    Params:
-        symbols:        List of symbols to trade
-        fast_period:    Fast MA lookback (default 20)
-        slow_period:    Slow MA lookback (default 50)
-        vol_lookback:   Bars for realized vol calculation (default 30)
-        vol_threshold:  Annualized vol above which regime is "high" (default 0.25)
-        interval:       Bar interval for correct vol annualization (default "15m")
-    """
+    """MA Crossover — always-in-market long/short strategy."""
 
     def __init__(self, event_bus: EventBus, params: dict = None):
-        from strategies import BaseStrategy  # avoid circular at module level
-
         default_params = {
             "symbols": ["SPY"],
             "fast_period": 20,
             "slow_period": 50,
             "vol_lookback": 30,
-            "vol_threshold": 0.25,   # Annualized vol threshold
+            "vol_threshold": 0.25,
             "interval": "15m",
         }
-        merged = {**default_params, **(params or {})}
-
         self.name = "ma_crossover"
         self.event_bus = event_bus
-        self.params = merged
+        self.params = {**default_params, **(params or {})}
         self._is_active = True
 
-        # Internal state
         self._price_history: Dict[str, list] = defaultdict(list)
         self._bar_history: Dict[str, list] = defaultdict(list)
-        self._prev_fast_ma: Dict[str, Optional[float]] = {}
-        self._prev_slow_ma: Dict[str, Optional[float]] = {}
-        self._in_position: Dict[str, bool] = {}
 
-        # Signal funnel for diagnostics
+        # "long", "short", or None (flat, between exit and next entry)
+        self._position: Dict[str, Optional[str]] = {}
+
         self._funnel = {
             "bars_processed": 0,
             "warmup_skip": 0,
-            "no_crossover": 0,
-            "bullish_crossover": 0,
-            "bearish_crossover": 0,
-            "already_in_position": 0,
-            "not_in_position": 0,
-            "entries_sent": 0,
-            "exits_sent": 0,
+            "no_change": 0,
+            "long_entries": 0,
+            "short_entries": 0,
+            "long_exits": 0,
+            "short_exits": 0,
             "regime_high": 0,
             "regime_low": 0,
         }
 
-        # Subscribe
-        from core.events import EventType, MarketDataEvent
         self.event_bus.subscribe(EventType.MARKET_DATA, self.on_market_data)
 
-    def on_market_data(self, event) -> None:
-        """Handle incoming bar."""
+    def on_market_data(self, event: MarketDataEvent) -> None:
         if not self._is_active:
             return
         symbol = event.symbol
+        if symbol not in self.params.get("symbols", []):
+            return
+
         self._price_history[symbol].append(event.close)
         self._bar_history[symbol].append({
             "timestamp": event.bar_timestamp or event.timestamp,
@@ -94,154 +82,135 @@ class MACrossoverStrategy:
             "low": event.low, "close": event.close,
             "volume": event.volume,
         })
-        signal = self.calculate_signal(symbol)
+
+        signal = self._decide(symbol)
         if signal is not None:
             self.event_bus.publish(signal)
 
-    def get_prices(self, symbol: str) -> np.ndarray:
-        return np.array(self._price_history.get(symbol, []))
-
-    # --- Core indicators ---
-
-    def _moving_average(self, prices: np.ndarray, period: int) -> Optional[float]:
-        if len(prices) < period:
-            return None
-        return float(prices[-period:].mean())
-
-    def _realized_volatility(self, prices: np.ndarray, lookback: int) -> Optional[float]:
-        """Compute annualized realized volatility, adapting to the bar interval."""
-        if len(prices) < lookback + 1:
-            return None
-        log_returns = np.diff(np.log(prices[-lookback - 1:]))
-        # Annualize using the correct factor for this interval
-        bpy = _bars_per_year(self.params.get("interval", "15m"))
-        return float(log_returns.std() * np.sqrt(bpy))
-
-    def _get_regime(self, symbol: str) -> str:
-        """Determine volatility regime: 'low' or 'high'."""
-        prices = self.get_prices(symbol)
-        vol = self._realized_volatility(prices, self.params["vol_lookback"])
-        if vol is None:
-            return "unknown"
-        regime = "high" if vol > self.params["vol_threshold"] else "low"
-        if regime == "high":
-            self._funnel["regime_high"] += 1
-        else:
-            self._funnel["regime_low"] += 1
-        return regime
-
-    # --- Signal generation ---
-
-    def calculate_signal(self, symbol: str) -> Optional[SignalEvent]:
-        """Generate MA crossover signal with regime filter."""
-        if symbol not in self.params.get("symbols", []):
-            return None
-
+    def _decide(self, symbol: str) -> Optional[SignalEvent]:
+        """One signal per bar. Exit on flip bar, enter on next bar."""
         self._funnel["bars_processed"] += 1
 
-        prices = self.get_prices(symbol)
-        fast_period = self.params["fast_period"]
-        slow_period = self.params["slow_period"]
-
-        fast_ma = self._moving_average(prices, fast_period)
-        slow_ma = self._moving_average(prices, slow_period)
+        prices = np.array(self._price_history[symbol])
+        fast_ma = self._ma(prices, self.params["fast_period"])
+        slow_ma = self._ma(prices, self.params["slow_period"])
 
         if fast_ma is None or slow_ma is None:
             self._funnel["warmup_skip"] += 1
             return None
 
-        prev_fast = self._prev_fast_ma.get(symbol)
-        prev_slow = self._prev_slow_ma.get(symbol)
-
-        # Update for next iteration
-        self._prev_fast_ma[symbol] = fast_ma
-        self._prev_slow_ma[symbol] = slow_ma
-
-        if prev_fast is None or prev_slow is None:
-            self._funnel["warmup_skip"] += 1
-            return None
+        desired = "long" if fast_ma > slow_ma else "short"
+        current = self._position.get(symbol)
 
         regime = self._get_regime(symbol)
-        in_pos = self._in_position.get(symbol, False)
+        strength = 1.0 if regime == "low" else 0.5
 
-        # --- Bullish crossover: fast crosses above slow ---
-        if prev_fast <= prev_slow and fast_ma > slow_ma:
-            self._funnel["bullish_crossover"] += 1
-            if not in_pos:
-                strength = 1.0 if regime == "low" else 0.5
-                self._in_position[symbol] = True
-                self._funnel["entries_sent"] += 1
-                return SignalEvent(
-                    symbol=symbol,
-                    signal_type=SignalType.LONG,
-                    strength=strength,
-                    strategy_name=self.name,
-                    metadata={
-                        "fast_ma": round(fast_ma, 4),
-                        "slow_ma": round(slow_ma, 4),
-                        "regime": regime,
-                        "crossover": "bullish",
-                    },
-                )
-            else:
-                self._funnel["already_in_position"] += 1
+        meta = {
+            "fast_ma": round(fast_ma, 4),
+            "slow_ma": round(slow_ma, 4),
+            "regime": regime,
+            "desired": desired,
+            "current": current or "flat",
+        }
 
-        # --- Bearish crossover: fast crosses below slow ---
-        elif prev_fast >= prev_slow and fast_ma < slow_ma:
-            self._funnel["bearish_crossover"] += 1
-            if in_pos:
-                self._in_position[symbol] = False
-                self._funnel["exits_sent"] += 1
-                return SignalEvent(
-                    symbol=symbol,
-                    signal_type=SignalType.EXIT_LONG,
-                    strength=0.0,
-                    strategy_name=self.name,
-                    metadata={
-                        "fast_ma": round(fast_ma, 4),
-                        "slow_ma": round(slow_ma, 4),
-                        "regime": regime,
-                        "crossover": "bearish",
-                    },
-                )
-            else:
-                self._funnel["not_in_position"] += 1
-        else:
-            self._funnel["no_crossover"] += 1
+        # Already correctly positioned
+        if desired == current:
+            self._funnel["no_change"] += 1
+            return None
 
+        # Need to exit first before reversing (flip takes 2 bars)
+        if current == "long" and desired == "short":
+            self._position[symbol] = None
+            self._funnel["long_exits"] += 1
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.EXIT_LONG,
+                strength=0.0, strategy_name=self.name,
+                metadata={**meta, "action": "exit_long_for_flip"},
+            )
+
+        if current == "short" and desired == "long":
+            self._position[symbol] = None
+            self._funnel["short_exits"] += 1
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.EXIT_SHORT,
+                strength=0.0, strategy_name=self.name,
+                metadata={**meta, "action": "exit_short_for_flip"},
+            )
+
+        # Flat → enter new position
+        if current is None and desired == "long":
+            self._position[symbol] = "long"
+            self._funnel["long_entries"] += 1
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.LONG,
+                strength=strength, strategy_name=self.name,
+                metadata={**meta, "action": "enter_long"},
+            )
+
+        if current is None and desired == "short":
+            self._position[symbol] = "short"
+            self._funnel["short_entries"] += 1
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.SHORT,
+                strength=strength, strategy_name=self.name,
+                metadata={**meta, "action": "enter_short"},
+            )
+
+        self._funnel["no_change"] += 1
         return None
 
-    # --- Diagnostics ---
+    def _ma(self, prices: np.ndarray, period: int) -> Optional[float]:
+        if len(prices) < period:
+            return None
+        return float(prices[-period:].mean())
+
+    def _get_regime(self, symbol: str) -> str:
+        prices = np.array(self._price_history.get(symbol, []))
+        lb = self.params["vol_lookback"]
+        if len(prices) < lb + 1:
+            return "unknown"
+        log_ret = np.diff(np.log(prices[-lb - 1:]))
+        bpy = _bars_per_year(self.params.get("interval", "15m"))
+        vol = float(log_ret.std() * np.sqrt(bpy))
+        regime = "high" if vol > self.params["vol_threshold"] else "low"
+        self._funnel[f"regime_{regime}"] += 1
+        return regime
+
+    def get_prices(self, symbol: str) -> np.ndarray:
+        return np.array(self._price_history.get(symbol, []))
+
+    def calculate_signal(self, symbol: str) -> Optional[SignalEvent]:
+        return None
 
     def get_diagnostics(self) -> Dict:
-        diagnostics = {}
-        for symbol in self.params.get("symbols", []):
-            prices = self.get_prices(symbol)
-            diagnostics[symbol] = {
-                "fast_ma": self._moving_average(prices, self.params["fast_period"]),
-                "slow_ma": self._moving_average(prices, self.params["slow_period"]),
-                "regime": self._get_regime(symbol),
-                "in_position": self._in_position.get(symbol, False),
-                "price_count": len(prices),
+        diag = {}
+        for sym in self.params.get("symbols", []):
+            prices = self.get_prices(sym)
+            diag[sym] = {
+                "fast_ma": self._ma(prices, self.params["fast_period"]),
+                "slow_ma": self._ma(prices, self.params["slow_period"]),
+                "position": self._position.get(sym, "flat"),
+                "bars": len(prices),
             }
-        diagnostics["_funnel"] = self._funnel
-        return diagnostics
+        diag["_funnel"] = self._funnel
+        return diag
 
     def print_funnel(self):
-        """Print the signal funnel — shows where signals die at each stage."""
         f = self._funnel
+        total_entries = f["long_entries"] + f["short_entries"]
+        total_exits = f["long_exits"] + f["short_exits"]
+        total_signals = total_entries + total_exits
         print(f"\n  SIGNAL FUNNEL — {self.name}")
         print(f"  {'─'*50}")
         print(f"  Bars processed:           {f['bars_processed']:>8,}")
-        print(f"    ├─ Warmup (not enough): {f['warmup_skip']:>8,}")
-        print(f"    ├─ No crossover:        {f['no_crossover']:>8,}")
-        print(f"    ├─ Bullish crossover:   {f['bullish_crossover']:>8,}")
-        print(f"    │   ├─ Already in pos:  {f['already_in_position']:>8,}")
-        print(f"    │   └─ ENTRY sent:      {f['entries_sent']:>8,}")
-        print(f"    └─ Bearish crossover:   {f['bearish_crossover']:>8,}")
-        print(f"        ├─ Not in pos:      {f['not_in_position']:>8,}")
-        print(f"        └─ EXIT sent:       {f['exits_sent']:>8,}")
+        print(f"    ├─ Warmup:              {f['warmup_skip']:>8,}")
+        print(f"    ├─ Already positioned:  {f['no_change']:>8,}")
+        print(f"    ├─ Enter LONG:          {f['long_entries']:>8,}")
+        print(f"    ├─ Enter SHORT:         {f['short_entries']:>8,}")
+        print(f"    ├─ Exit long (flip):    {f['long_exits']:>8,}")
+        print(f"    └─ Exit short (flip):   {f['short_exits']:>8,}")
         print(f"  {'─'*50}")
+        print(f"  Total signals:            {total_signals:>8,}  ({total_entries} entries + {total_exits} exits)")
         print(f"  Vol regime — low:         {f['regime_low']:>8,}")
         print(f"  Vol regime — high:        {f['regime_high']:>8,}")
         print(f"  {'─'*50}")
