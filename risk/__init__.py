@@ -45,8 +45,8 @@ class RiskManager:
         risk_config = config or {}
         self.max_position_pct = risk_config.get("max_position_pct", 0.20)
         self.max_portfolio_leverage = risk_config.get("max_portfolio_leverage", 1.0)
-        self.max_daily_drawdown_pct = risk_config.get("max_daily_drawdown_pct", 0.02)
-        self.max_total_drawdown_pct = risk_config.get("max_total_drawdown_pct", 0.10)
+        self.max_daily_drawdown_pct = risk_config.get("max_daily_drawdown_pct", 0.05)  # 5%
+        self.max_total_drawdown_pct = risk_config.get("max_total_drawdown_pct", 0.25)  # 25%
         self.max_open_orders = risk_config.get("max_open_orders", 10)
 
         # State tracking
@@ -55,6 +55,7 @@ class RiskManager:
         self._open_orders: Dict[str, OrderEvent] = {}
         self._trading_halted = False
         self._halt_reason = ""
+        self._halt_type = ""  # "daily" or "total" — daily resets each morning
         self._latest_prices: Dict[str, float] = {}
         self._latest_bar_time: Optional[datetime] = None  # Simulated time, not wall clock
         self._risk_log = []
@@ -89,24 +90,34 @@ class RiskManager:
         self._latest_prices[event.symbol] = event.close
         self._latest_bar_time = event.bar_timestamp or event.timestamp
 
-        # Track daily starting value
-        bar_date = (event.bar_timestamp or event.timestamp).date() if hasattr(
-            (event.bar_timestamp or event.timestamp), 'date'
-        ) else None
+        # Track daily starting value — reset daily halt each new trading day
+        bar_date = None
+        ts = event.bar_timestamp or event.timestamp
+        if hasattr(ts, 'date'):
+            bar_date = ts.date()
 
         if bar_date and bar_date != self._current_date:
             self._current_date = bar_date
             self._daily_start_value = self.portfolio.total_value
+            # Auto-resume if halted by daily drawdown (total drawdown stays halted)
+            if self._trading_halted and self._halt_type == "daily":
+                self._trading_halted = False
+                self._halt_reason = ""
+                self._halt_type = ""
+                self._log_risk_event("RESUME", "ALL", "risk_manager",
+                                     f"New trading day {bar_date} — daily halt reset")
 
         # Check daily drawdown
         if self._daily_start_value and self._daily_start_value > 0:
             daily_drawdown = (self._daily_start_value - self.portfolio.total_value) / self._daily_start_value
             if daily_drawdown > self.max_daily_drawdown_pct:
-                self._halt_trading(f"Daily drawdown limit breached: {daily_drawdown:.2%}")
+                if not self._trading_halted:
+                    self._halt_trading(f"Daily drawdown limit breached: {daily_drawdown:.2%}", halt_type="daily")
 
-        # Check total drawdown
+        # Check total drawdown (permanent halt — needs manual resume)
         if self.portfolio.drawdown > self.max_total_drawdown_pct:
-            self._halt_trading(f"Total drawdown limit breached: {self.portfolio.drawdown:.2%}")
+            if not self._trading_halted:
+                self._halt_trading(f"Total drawdown limit breached: {self.portfolio.drawdown:.2%}", halt_type="total")
 
     def on_fill(self, event: FillEvent) -> None:
         """Remove filled orders from open orders tracking."""
@@ -122,6 +133,15 @@ class RiskManager:
 
         order = self._signal_to_order(signal)
         if order is None:
+            # Log why — don't silently drop
+            price = self._latest_prices.get(signal.symbol, 0)
+            current_qty = 0
+            if signal.symbol in self.portfolio.positions:
+                current_qty = self.portfolio.positions[signal.symbol].quantity
+            self._log_risk_event("DROPPED", signal.symbol, signal.strategy_name,
+                                 f"{signal.signal_type.value} dropped: "
+                                 f"price=${price:.2f}, pos_qty={current_qty}, "
+                                 f"cash=${self.portfolio.cash:.0f}")
             return
 
         # Determine if this is an exit (position-reducing) order
@@ -270,15 +290,19 @@ class RiskManager:
 
         return True, "OK"
 
-    def _halt_trading(self, reason: str) -> None:
-        """Halt all trading due to risk breach."""
+    def _halt_trading(self, reason: str, halt_type: str = "total") -> None:
+        """Halt all trading due to risk breach.
+        
+        halt_type: "daily" resets next morning, "total" is permanent.
+        """
         self._trading_halted = True
         self._halt_reason = reason
+        self._halt_type = halt_type
         self.event_bus.publish(Event(
             event_type=EventType.RISK_BREACH,
-            data={"reason": reason, "action": "HALT"},
+            data={"reason": reason, "action": "HALT", "type": halt_type},
         ))
-        self._log_risk_event("HALT", "ALL", "risk_manager", reason)
+        self._log_risk_event("HALT", "ALL", "risk_manager", f"[{halt_type}] {reason}")
 
     def _log_risk_event(self, action: str, symbol: str, strategy: str, detail: str) -> None:
         self._risk_log.append({
