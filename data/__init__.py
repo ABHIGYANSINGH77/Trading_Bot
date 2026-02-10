@@ -194,12 +194,24 @@ class IBKRDataSource(DataSource):
     """
 
     # Max duration per single request for each bar size
+    # IBKR pacing: max 60 historical data requests per 10 minutes
     _MAX_DURATION = {
-        "1 min": 1,       # days
-        "5 mins": 7,      # days
-        "15 mins": 14,    # days
-        "1 hour": 30,     # days
-        "1 day": 365,     # days
+        "1 min": 1,       # 1 day per request
+        "2 mins": 2,
+        "3 mins": 3,
+        "5 mins": 7,      # 1 week
+        "10 mins": 14,    # 2 weeks
+        "15 mins": 14,    # 2 weeks
+        "20 mins": 14,
+        "30 mins": 30,    # 1 month
+        "1 hour": 30,     # 1 month
+        "2 hours": 30,
+        "3 hours": 30,
+        "4 hours": 30,
+        "8 hours": 60,
+        "1 day": 365,     # 1 year
+        "1 week": 730,
+        "1 month": 1825,
     }
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1):
