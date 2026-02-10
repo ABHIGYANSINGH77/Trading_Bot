@@ -19,14 +19,11 @@ from core.events import (
 # Approximate trading bars per day for each interval
 # US equity market: 6.5 hours/day = 390 minutes
 _BARS_PER_DAY = {
-    "1m": 390,
-    "5m": 78,
-    "15m": 26,
-    "30m": 13,
-    "1h": 7,      # 6.5 rounded up
-    "4h": 2,
-    "1d": 1,
-    "1wk": 0.2,
+    "1m": 390, "2m": 195, "3m": 130,
+    "5m": 78, "10m": 39, "15m": 26,
+    "20m": 20, "30m": 13,
+    "1h": 7, "2h": 3, "3h": 2, "4h": 2, "8h": 1,
+    "1d": 1, "1wk": 0.2,
 }
 
 def bars_per_year(interval: str) -> float:

@@ -106,7 +106,7 @@ class BacktestEngine:
         # Yahoo Finance intraday data limits:
         #   1m: last 7 days, 5m/15m: last 60 days, 1h: last 730 days
         # Auto-adjust dates if user requests a range that's too old
-        is_intraday = interval in ("1m", "5m", "15m", "1h")
+        is_intraday = interval not in ("1d", "1wk", "1mo")
         if is_intraday and data_source == "yfinance":
             from datetime import datetime, timedelta
             max_days = {"1m": 6, "5m": 59, "15m": 59, "1h": 729}.get(interval, 59)
@@ -143,16 +143,23 @@ class BacktestEngine:
                 "trading", {}
             ).get("universe", ["AAPL"])
 
-        # Map interval to yfinance/data manager format
+        # Map user interval to IBKR bar size string
+        # IBKR supports: 1/2/3/5/10/15/20/30 mins, 1/2/3/4/8 hours, 1 day/week/month
         bar_size_map = {
-            "1m": "1 min", "5m": "5 mins", "15m": "15 mins",
-            "1h": "1 hour", "1d": "1 day",
+            "1m": "1 min", "2m": "2 mins", "3m": "3 mins",
+            "5m": "5 mins", "10m": "10 mins", "15m": "15 mins",
+            "20m": "20 mins", "30m": "30 mins",
+            "1h": "1 hour", "2h": "2 hours", "3h": "3 hours",
+            "4h": "4 hours", "8h": "8 hours",
+            "1d": "1 day", "1wk": "1 week", "1mo": "1 month",
         }
-        bar_size = bar_size_map.get(interval, "1 day")
+        bar_size = bar_size_map.get(interval)
+        if bar_size is None:
+            valid = ", ".join(bar_size_map.keys())
+            raise ValueError(f"Unsupported interval '{interval}'. Valid: {valid}")
 
         # For intraday, yfinance has date range limits
-        # 5m: max 60 days, 15m: max 60 days, 1h: max 730 days
-        is_intraday = interval in ("1m", "5m", "15m", "1h")
+        is_intraday = interval not in ("1d", "1wk", "1mo")
 
         # Handle benchmark
         if benchmark is None and not is_intraday:
@@ -227,10 +234,17 @@ class BacktestEngine:
         elapsed = time.time() - start_time
         print(f"Done: {bar_count} bars in {elapsed:.2f}s")
 
-        # Build results
-        metrics = self.portfolio.calculate_metrics(interval=interval)
+        # Build results — pass interval for correct annualization
+        try:
+            metrics = self.portfolio.calculate_metrics(interval=interval)
+        except TypeError:
+            # Old portfolio.py without interval param — fall back
+            metrics = self.portfolio.calculate_metrics()
+            metrics["interval"] = interval
         metrics["elapsed_seconds"] = elapsed
         metrics["total_bars"] = bar_count
+        if "initial_capital" not in metrics:
+            metrics["initial_capital"] = self.portfolio.initial_capital
 
         trade_log = self.portfolio.get_trade_log_df()
         paired_trades = self._pair_trades(trade_log)
@@ -412,12 +426,7 @@ class BacktestEngine:
         return pd.DataFrame(paired) if paired else pd.DataFrame()
 
     def print_results(self) -> None:
-        """Pretty print backtest results.
-
-        Portfolio-level metrics (Sharpe, vol, drawdown) come from portfolio.calculate_metrics().
-        Trade-level metrics (win rate, profit factor, expectancy) are computed here
-        from paired_trades — the actual round-trip trade records.
-        """
+        """Pretty-print backtest results with full P&L reconciliation."""
         if not self._results:
             print("No results. Run backtest first.")
             return
@@ -426,23 +435,27 @@ class BacktestEngine:
         paired = self._results["paired_trades"]
         strat_names = ", ".join(s.name for s in self.strategies)
 
+        initial_capital = self.portfolio.initial_capital
+        final_value = self.portfolio.total_value
+        portfolio_change = final_value - initial_capital
+
         print(f"\n{'='*60}")
         print(f"  BACKTEST RESULTS — {strat_names}")
         print(f"{'='*60}")
         print(f"  Interval:              {m.get('interval', '?'):>14}")
         print(f"  Total Bars:            {m.get('total_bars', 0):>14,}")
-        print(f"  Initial Capital:       ${m.get('initial_capital', 0):>13,.2f}")
-        print(f"  Final Value:           ${m.get('final_value', 0):>13,.2f}")
-        print(f"  Total Return:          {m.get('total_return', 0):>14.2%}")
+        print(f"  Initial Capital:       ${initial_capital:>13,.2f}")
+        print(f"  Final Value:           ${final_value:>13,.2f}")
+        print(f"  Total Return:       {m.get('total_return', 0):>+14.2%}  (${portfolio_change:>+,.2f})")
         print(f"  Annualized Return:     {m.get('annualized_return', 0):>14.2%}")
         print(f"  Volatility (ann.):     {m.get('volatility', 0):>14.2%}")
         print(f"  Sharpe Ratio:          {m.get('sharpe_ratio', 0):>14.3f}")
         print(f"  Sortino Ratio:         {m.get('sortino_ratio', 0):>14.3f}")
         print(f"  Max Drawdown:          {m.get('max_drawdown', 0):>14.2%}")
-        print(f"  Total Commission:      ${m.get('total_commission', 0):>13,.2f}")
         print(f"{'='*60}")
 
-        # --- Trade-level analysis from paired_trades ---
+        # ── Trade-level analysis ──
+        closed_pnl = 0.0
         if not paired.empty:
             total_trades = len(paired)
             wins = paired[paired["win"]]
@@ -466,10 +479,8 @@ class BacktestEngine:
             worst_pct = paired["pnl_pct"].min()
             best_dollar = paired["net_pnl"].max()
             worst_dollar = paired["net_pnl"].min()
-            total_net = paired["net_pnl"].sum()
+            closed_pnl = paired["net_pnl"].sum()
 
-            # Inject trade-level metrics into results for export
-            # (already computed in run(), but update if print_results is called standalone)
             m.update({
                 "win_rate": win_rate,
                 "profit_factor": profit_factor,
@@ -488,7 +499,7 @@ class BacktestEngine:
             print(f"  Expectancy:             {expectancy_pct:>+12.2f}%  (${expectancy_dollar:>+10,.2f})")
             print(f"  Best Trade:             {best_pct:>+12.2f}%  (${best_dollar:>+10,.2f})")
             print(f"  Worst Trade:            {worst_pct:>+12.2f}%  (${worst_dollar:>+10,.2f})")
-            print(f"  Net P&L:               ${total_net:>13,.2f}")
+            print(f"  Closed P&L:            ${closed_pnl:>+13,.2f}")
 
             print(f"\n  {'Symbol':<6} {'Dir':<6} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
             print(f"  {'-'*72}")
@@ -503,19 +514,78 @@ class BacktestEngine:
         else:
             print("\n  No round-trip trades completed.")
 
+        # ── Open positions at end ──
+        open_positions = self.portfolio.active_positions
+        unrealized_pnl = 0.0
+        if open_positions:
+            print(f"\n  OPEN POSITIONS AT END")
+            print(f"  {'-'*56}")
+            for symbol, pos in open_positions.items():
+                direction = "LONG" if pos.quantity > 0 else "SHORT"
+                upnl = pos.unrealized_pnl
+                entry_p = pos.avg_entry_price
+                curr_p = pos.current_price
+                upnl_pct = ((curr_p / entry_p) - 1) * 100
+                if pos.quantity < 0:
+                    upnl_pct = -upnl_pct
+                unrealized_pnl += upnl
+                print(
+                    f"  {symbol:<6} {direction:<6} {abs(pos.quantity):>4} sh "
+                    f"@ ${entry_p:>8,.2f} → ${curr_p:>8,.2f} "
+                    f" {upnl_pct:>+7.2f}%  ${upnl:>+9,.2f}"
+                )
+
+        # ── P&L Reconciliation (uses portfolio's own accounting → exact) ──
+        realized = self.portfolio.realized_pnl
+        unrealized = self.portfolio.unrealized_pnl
+        commission = self.portfolio.total_commission
+        net_pnl = realized + unrealized - commission
+
+        print(f"\n  P&L RECONCILIATION")
+        print(f"  {'-'*56}")
+        print(f"  Realized P&L:          ${realized:>+13,.2f}")
+        print(f"  Unrealized P&L:        ${unrealized:>+13,.2f}")
+        print(f"  Commission:            ${-commission:>+13,.2f}")
+        print(f"  {'-'*56}")
+        print(f"  Computed net:          ${net_pnl:>+13,.2f}")
+        print(f"  Portfolio change:      ${portfolio_change:>+13,.2f}")
+
+        diff = abs(net_pnl - portfolio_change)
+        if diff > 0.02:
+            print(f"  ⚠ Rounding gap: ${diff:.2f}")
+        else:
+            print(f"  ✓ Exact match")
+
         print(f"{'='*60}")
 
-        # Risk report
+        # ── Risk report ──
         risk_log = self._results.get("risk_log", [])
         approved = sum(1 for r in risk_log if r.get("action") == "APPROVED")
         rejected = sum(1 for r in risk_log if r.get("action") == "REJECTED")
+        blocked = sum(1 for r in risk_log if r.get("action") == "BLOCKED")
+        dropped = sum(1 for r in risk_log if r.get("action") == "DROPPED")
+        halts = [r for r in risk_log if r.get("action") == "HALT"]
+        resumes = sum(1 for r in risk_log if r.get("action") == "RESUME")
+
         if risk_log:
-            print(f"\n  Risk: {approved} orders approved, {rejected} rejected")
+            print(f"\n  Risk: {approved} approved, {rejected} rejected", end="")
+            if blocked:
+                print(f", {blocked} blocked (drawdown halt)", end="")
+            if dropped:
+                print(f", {dropped} dropped (sizing)", end="")
+            print()
+
+            if halts:
+                for h in halts:
+                    print(f"    ⚠ HALT: {h.get('detail', '?')}")
+                if resumes:
+                    print(f"    ↻ Resumed {resumes} time(s) (daily reset)")
+
             for r in risk_log:
                 if r.get("action") == "REJECTED":
-                    print(f"    REJECTED: {r.get('detail', '?')} | {r.get('symbol', '?')}")
+                    print(f"    REJECTED: {r.get('detail', '?')}")
 
-        # Strategy signal funnels
+        # ── Strategy funnels ──
         for strategy in self.strategies:
             if hasattr(strategy, "print_funnel"):
                 strategy.print_funnel()
