@@ -92,6 +92,25 @@ class BOSStrategy(BaseStrategy):
         self._target_price: Dict[str, float] = {}
         self._trade_count: Dict[str, int] = defaultdict(int)
 
+        # Signal funnel diagnostics — tracks why signals are filtered
+        self._funnel = {
+            "bars_processed": 0,
+            "bos_detected": 0,
+            "filtered_no_bos": 0,
+            "filtered_in_position": 0,
+            "filtered_pending": 0,
+            "filtered_volume": 0,
+            "filtered_vwap": 0,
+            "filtered_rsi": 0,
+            "pending_created": 0,
+            "pullback_timeout": 0,
+            "pullback_entered": 0,
+            "exits_stop": 0,
+            "exits_target": 0,
+            "exits_reversal": 0,
+            "signals_sent": 0,
+        }
+
     def calculate_signal(self, symbol: str) -> Optional[SignalEvent]:
         """Main signal logic for BOS strategy."""
         if symbol not in self.params.get("symbols", []):
@@ -128,13 +147,16 @@ class BOSStrategy(BaseStrategy):
 
         # Store structure for diagnostics
         self._last_structure[symbol] = structure
+        self._funnel["bars_processed"] += 1
 
         # --- Check for exits first ---
         if symbol in self._in_position:
+            self._funnel["filtered_in_position"] += 1
             return self._check_exit(symbol, current_price, current_atr, structure)
 
         # --- Check for pending pullback entries ---
         if symbol in self._pending_entry:
+            self._funnel["filtered_pending"] += 1
             return self._check_pullback_entry(
                 symbol, current_price, current_rsi, current_rvol,
                 current_vwap, current_atr
@@ -144,28 +166,36 @@ class BOSStrategy(BaseStrategy):
         bos = structure["structure_break"]
 
         if bos == StructureBreak.NONE:
+            self._funnel["filtered_no_bos"] += 1
             return None
+
+        self._funnel["bos_detected"] += 1
 
         # --- Volume confirmation ---
         if self.params["use_volume_filter"] and current_rvol < self.params["rvol_threshold"]:
+            self._funnel["filtered_volume"] += 1
             return None  # Not enough volume behind the break
 
         # --- VWAP confirmation ---
         if self.params["use_vwap_filter"]:
             if bos in (StructureBreak.BULLISH_BOS, StructureBreak.BULLISH_CHOCH):
                 if current_price < current_vwap:
-                    return None  # Price below VWAP contradicts bullish break
+                    self._funnel["filtered_vwap"] += 1
+                    return None
             elif bos in (StructureBreak.BEARISH_BOS, StructureBreak.BEARISH_CHOCH):
                 if current_price > current_vwap:
-                    return None  # Price above VWAP contradicts bearish break
+                    self._funnel["filtered_vwap"] += 1
+                    return None
 
         # --- RSI filter: don't chase extremes ---
         if bos in (StructureBreak.BULLISH_BOS, StructureBreak.BULLISH_CHOCH):
             if current_rsi > self.params["rsi_overbought"]:
-                return None  # Too extended
+                self._funnel["filtered_rsi"] += 1
+                return None
         elif bos in (StructureBreak.BEARISH_BOS, StructureBreak.BEARISH_CHOCH):
             if current_rsi < self.params["rsi_oversold"]:
-                return None  # Too extended
+                self._funnel["filtered_rsi"] += 1
+                return None
 
         # --- Set up pending entry (wait for pullback) ---
         last_sh = structure["last_swing_high"]
@@ -189,6 +219,7 @@ class BOSStrategy(BaseStrategy):
                 "bars_waiting": 0,
                 "max_wait_bars": 10,
             }
+            self._funnel["pending_created"] += 1
 
         elif bos in (StructureBreak.BEARISH_BOS, StructureBreak.BEARISH_CHOCH) and last_sl:
             # Bearish BOS: wait for pullback toward the broken swing low
@@ -208,6 +239,7 @@ class BOSStrategy(BaseStrategy):
                 "bars_waiting": 0,
                 "max_wait_bars": 10,
             }
+            self._funnel["pending_created"] += 1
 
         return None  # Signal comes on pullback, not on the break itself
 
@@ -222,6 +254,7 @@ class BOSStrategy(BaseStrategy):
         # Cancel if waited too long
         if pending["bars_waiting"] > pending["max_wait_bars"]:
             del self._pending_entry[symbol]
+            self._funnel["pullback_timeout"] += 1
             return None
 
         if pending["direction"] == "long":
@@ -234,6 +267,8 @@ class BOSStrategy(BaseStrategy):
                 self._stop_price[symbol] = pending["stop"]
                 self._target_price[symbol] = pending["target"]
                 self._trade_count[symbol] += 1
+                self._funnel["pullback_entered"] += 1
+                self._funnel["signals_sent"] += 1
 
                 return SignalEvent(
                     symbol=symbol,
@@ -260,6 +295,8 @@ class BOSStrategy(BaseStrategy):
                 self._stop_price[symbol] = pending["stop"]
                 self._target_price[symbol] = pending["target"]
                 self._trade_count[symbol] += 1
+                self._funnel["pullback_entered"] += 1
+                self._funnel["signals_sent"] += 1
 
                 return SignalEvent(
                     symbol=symbol,
@@ -322,6 +359,15 @@ class BOSStrategy(BaseStrategy):
             entry = self._entry_price.get(symbol, price)
             pnl_pct = (price - entry) / entry if direction == "long" else (entry - price) / entry
 
+            # Track exit reason
+            if exit_reason == "stop_loss":
+                self._funnel["exits_stop"] += 1
+            elif exit_reason == "take_profit":
+                self._funnel["exits_target"] += 1
+            elif exit_reason == "structure_reversal":
+                self._funnel["exits_reversal"] += 1
+            self._funnel["signals_sent"] += 1
+
             # Clean up state
             del self._in_position[symbol]
             self._entry_price.pop(symbol, None)
@@ -363,4 +409,28 @@ class BOSStrategy(BaseStrategy):
                 "target": self._target_price.get(symbol),
                 "bars": len(self._bar_history.get(symbol, [])),
             }
+        diag["_funnel"] = self._funnel
         return diag
+
+    def print_funnel(self):
+        """Print the signal funnel — shows where signals die at each stage."""
+        f = self._funnel
+        print(f"\n  SIGNAL FUNNEL — {self.name}")
+        print(f"  {'─'*50}")
+        print(f"  Bars processed:           {f['bars_processed']:>8,}")
+        print(f"    ├─ No BOS detected:     {f['filtered_no_bos']:>8,}  (no structure break)")
+        print(f"    ├─ In position (exit):   {f['filtered_in_position']:>8,}  (already in trade)")
+        print(f"    ├─ Pending pullback:     {f['filtered_pending']:>8,}  (waiting for entry)")
+        print(f"    └─ BOS detected:        {f['bos_detected']:>8,}  ← potential signals")
+        print(f"        ├─ Volume filtered:  {f['filtered_volume']:>8,}  (RVOL < {self.params['rvol_threshold']})")
+        print(f"        ├─ VWAP filtered:    {f['filtered_vwap']:>8,}  (price vs VWAP)")
+        print(f"        ├─ RSI filtered:     {f['filtered_rsi']:>8,}  (overbought/oversold)")
+        print(f"        └─ Pending created:  {f['pending_created']:>8,}  ← waiting for pullback")
+        print(f"            ├─ Timed out:    {f['pullback_timeout']:>8,}  (no pullback in 10 bars)")
+        print(f"            └─ ENTERED:      {f['pullback_entered']:>8,}  ← actual entries")
+        print(f"  {'─'*50}")
+        print(f"  Total signals sent:       {f['signals_sent']:>8,}  (entries + exits)")
+        print(f"  Exits — stop loss:        {f['exits_stop']:>8,}")
+        print(f"  Exits — take profit:      {f['exits_target']:>8,}")
+        print(f"  Exits — reversal:         {f['exits_reversal']:>8,}")
+        print(f"  {'─'*50}")

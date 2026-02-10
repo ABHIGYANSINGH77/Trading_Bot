@@ -12,6 +12,37 @@ from core.events import (
 )
 
 
+# ================================================================
+#  Annualization helpers
+# ================================================================
+
+# Approximate trading bars per day for each interval
+# US equity market: 6.5 hours/day = 390 minutes
+_BARS_PER_DAY = {
+    "1m": 390,
+    "5m": 78,
+    "15m": 26,
+    "30m": 13,
+    "1h": 7,      # 6.5 rounded up
+    "4h": 2,
+    "1d": 1,
+    "1wk": 0.2,
+}
+
+def bars_per_year(interval: str) -> float:
+    """Return expected number of bars in a trading year for given interval."""
+    bpd = _BARS_PER_DAY.get(interval, 1)
+    return bpd * 252
+
+def annualization_factor(interval: str) -> float:
+    """Return sqrt(bars_per_year) for annualizing standard deviation."""
+    return np.sqrt(bars_per_year(interval))
+
+
+# ================================================================
+#  Position
+# ================================================================
+
 @dataclass
 class Position:
     """Represents a position in a single instrument."""
@@ -65,11 +96,12 @@ class Position:
             self.current_price = price
             return
 
-        # Same direction - increase position
+        # Same direction - increase position (pyramid)
         if (self.quantity > 0 and quantity > 0) or (self.quantity < 0 and quantity < 0):
             total_cost = self.avg_entry_price * abs(self.quantity) + price * abs(quantity)
             self.quantity += quantity
-            self.avg_entry_price = total_cost / abs(self.quantity)
+            if self.quantity != 0:
+                self.avg_entry_price = total_cost / abs(self.quantity)
         else:
             # Opposite direction - reduce or reverse
             close_qty = min(abs(quantity), abs(self.quantity))
@@ -89,6 +121,10 @@ class Position:
         self.current_price = price
 
 
+# ================================================================
+#  Snapshot
+# ================================================================
+
 @dataclass
 class PortfolioSnapshot:
     """Point-in-time portfolio state for tracking history."""
@@ -102,6 +138,10 @@ class PortfolioSnapshot:
     positions: Dict[str, int]  # symbol -> quantity
     drawdown: float = 0.0
 
+
+# ================================================================
+#  Portfolio
+# ================================================================
 
 class Portfolio:
     """Manages all positions and portfolio-level metrics.
@@ -264,40 +304,82 @@ class Portfolio:
             })
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    def calculate_metrics(self) -> Dict:
-        """Calculate portfolio performance metrics."""
+    def calculate_metrics(self, interval: str = "1d") -> Dict:
+        """Calculate portfolio-level performance metrics.
+
+        Args:
+            interval: Bar interval for correct annualization.
+                      "1d", "15m", "5m", "1h", etc.
+
+        NOTE: This computes portfolio-level stats only (return, vol, Sharpe).
+              Trade-level stats (win rate, profit factor) are computed in
+              BacktestEngine.print_results() from paired_trades, because
+              the portfolio doesn't know about round-trip trades.
+        """
         df = self.get_history_df()
         if df.empty or len(df) < 2:
-            return {}
+            return {
+                "initial_capital": self.initial_capital,
+                "final_value": self.total_value,
+                "total_return": 0.0,
+            }
 
+        # --- Total return: always from initial_capital ---
+        total_return = (self.total_value - self.initial_capital) / self.initial_capital
+
+        # --- Bar-level returns for risk metrics ---
         returns = df["total_value"].pct_change().dropna()
-        total_return = (df["total_value"].iloc[-1] / df["total_value"].iloc[0]) - 1
-        trading_days = len(returns)
-        ann_factor = np.sqrt(252)
+        returns = returns.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        n_bars = len(returns)
 
-        metrics = {
-            "total_return": total_return,
-            "annualized_return": (1 + total_return) ** (252 / max(trading_days, 1)) - 1,
-            "volatility": returns.std() * ann_factor,
-            "sharpe_ratio": (returns.mean() / returns.std() * ann_factor) if returns.std() > 0 else 0,
-            "max_drawdown": df["drawdown"].max(),
-            "win_rate": (returns > 0).mean(),
-            "total_trades": len(self.trade_log),
-            "total_commission": self.total_commission,
-            "final_value": self.total_value,
-            "trading_days": trading_days,
-        }
+        # --- Annualization: interval-aware ---
+        bpy = bars_per_year(interval)
+        ann = annualization_factor(interval)  # sqrt(bars_per_year)
 
-        # Sortino ratio (downside deviation)
+        # Annualized return
+        if n_bars > 0 and bpy > 0:
+            ann_return = (1 + total_return) ** (bpy / n_bars) - 1
+        else:
+            ann_return = 0.0
+
+        # Volatility (annualized)
+        vol = returns.std() * ann if returns.std() > 0 else 0.0
+
+        # Sharpe ratio (assuming 0 risk-free rate for simplicity)
+        if returns.std() > 0:
+            sharpe = (returns.mean() / returns.std()) * ann
+        else:
+            sharpe = 0.0
+
+        # Sortino ratio (downside deviation only)
         downside = returns[returns < 0]
         if len(downside) > 0 and downside.std() > 0:
-            metrics["sortino_ratio"] = returns.mean() / downside.std() * ann_factor
+            sortino = (returns.mean() / downside.std()) * ann
         else:
-            metrics["sortino_ratio"] = 0.0
+            sortino = 0.0
+
+        # Max drawdown
+        max_dd = df["drawdown"].max()
+
+        metrics = {
+            "initial_capital": self.initial_capital,
+            "final_value": round(self.total_value, 2),
+            "total_return": total_return,
+            "annualized_return": ann_return,
+            "volatility": vol,
+            "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
+            "max_drawdown": max_dd,
+            "total_commission": self.total_commission,
+            "total_fills": len(self.trade_log),
+            "n_bars": n_bars,
+            "interval": interval,
+            "bars_per_year": bpy,
+        }
 
         # Calmar ratio
-        if metrics["max_drawdown"] > 0:
-            metrics["calmar_ratio"] = metrics["annualized_return"] / metrics["max_drawdown"]
+        if max_dd > 0:
+            metrics["calmar_ratio"] = ann_return / max_dd
         else:
             metrics["calmar_ratio"] = 0.0
 

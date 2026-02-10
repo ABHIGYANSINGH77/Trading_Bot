@@ -8,11 +8,15 @@ Risk checks:
 - Portfolio leverage limits
 - Drawdown limits (daily and total)
 - Maximum open orders
-- Correlation limits between positions
+
+CRITICAL: Exit orders (closing positions) are ALWAYS allowed through
+position size checks. Only entry orders that INCREASE exposure are
+checked against limits. Blocking exits is the #1 risk manager bug
+in quant systems — it traps you in losing positions.
 """
 
 from datetime import datetime, date
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import numpy as np
 
 from core.events import (
@@ -52,16 +56,38 @@ class RiskManager:
         self._trading_halted = False
         self._halt_reason = ""
         self._latest_prices: Dict[str, float] = {}
+        self._latest_bar_time: Optional[datetime] = None  # Simulated time, not wall clock
         self._risk_log = []
+        self._symbols: List[str] = []
 
         # Subscribe to events
         self.event_bus.subscribe(EventType.SIGNAL, self.on_signal)
         self.event_bus.subscribe(EventType.MARKET_DATA, self.on_market_data)
         self.event_bus.subscribe(EventType.FILL, self.on_fill)
 
+    def set_symbols(self, symbols: list):
+        """Auto-scale position limits based on number of symbols.
+
+        For single-stock backtests, 20% is nonsensical — you'd use 80-90%
+        of capital. For multi-stock portfolios, smaller limits keep
+        diversification. This ALWAYS overrides config because position
+        sizing must match the actual trading universe.
+        """
+        self._symbols = symbols
+        n = len(symbols)
+        if n <= 1:
+            self.max_position_pct = 0.90  # Single stock: use up to 90%
+        elif n == 2:
+            self.max_position_pct = 0.50  # Two stocks: 50% each max
+        elif n <= 5:
+            self.max_position_pct = 0.30
+        else:
+            self.max_position_pct = 0.20  # 6+: standard diversification
+
     def on_market_data(self, event: MarketDataEvent) -> None:
-        """Track prices and check daily drawdown."""
+        """Track prices, bar timestamps, and check daily drawdown."""
         self._latest_prices[event.symbol] = event.close
+        self._latest_bar_time = event.bar_timestamp or event.timestamp
 
         # Track daily starting value
         bar_date = (event.bar_timestamp or event.timestamp).date() if hasattr(
@@ -98,23 +124,30 @@ class RiskManager:
         if order is None:
             return
 
+        # Determine if this is an exit (position-reducing) order
+        is_exit = signal.signal_type in (
+            SignalType.EXIT_LONG, SignalType.EXIT_SHORT, SignalType.FLAT
+        )
+
         # Run risk checks
-        passed, reason = self._check_risk(order, signal)
+        passed, reason = self._check_risk(order, signal, is_exit=is_exit)
 
         if passed:
             self._open_orders[order.order_id] = order
             self.event_bus.publish(order)
             self._log_risk_event("APPROVED", order.symbol, signal.strategy_name,
-                                 f"Order approved: {order.side.value} {order.quantity} {order.symbol}")
+                                 f"{order.side.value} {order.quantity} {order.symbol} "
+                                 f"@ ~${self._latest_prices.get(order.symbol, 0):.2f}"
+                                 f"{' [EXIT]' if is_exit else ''}")
         else:
             self._log_risk_event("REJECTED", order.symbol, signal.strategy_name, reason)
-            self.event_bus.publish(Event(
-                event_type=EventType.RISK_BREACH,
-                data={"reason": reason, "order": order, "signal": signal},
-            ))
 
     def _signal_to_order(self, signal: SignalEvent) -> Optional[OrderEvent]:
-        """Convert a signal event to an order event with proper sizing."""
+        """Convert a signal event to an order event with proper sizing.
+
+        Position sizing is unified here — we compute the max allowed quantity
+        based on risk limits so the order is ALWAYS within bounds.
+        """
         symbol = signal.symbol
         price = self._latest_prices.get(symbol, 0)
 
@@ -125,42 +158,46 @@ class RiskManager:
         if portfolio_value <= 0:
             return None
 
-        # Calculate position size based on signal strength and risk limits
-        max_position_value = portfolio_value * self.max_position_pct
-        target_value = max_position_value * signal.strength
-
         # Get current position
         current_qty = 0
+        current_position_value = 0
         if symbol in self.portfolio.positions:
             current_qty = self.portfolio.positions[symbol].quantity
+            current_position_value = abs(current_qty * price)
 
         if signal.signal_type == SignalType.LONG:
-            # Buy to open/increase long
-            target_qty = int(target_value / price)
-            qty_to_trade = max(0, target_qty - current_qty)
-            if qty_to_trade == 0:
+            # How much room do we have within the position limit?
+            max_allowed_value = portfolio_value * self.max_position_pct
+            remaining_value = max(0, max_allowed_value - current_position_value)
+
+            # Scale by signal strength
+            target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
+
+            # Never exceed available cash (keep 5% buffer for commissions)
+            available_cash = self.portfolio.cash * 0.95
+            target_value = min(target_value, available_cash)
+
+            qty_to_trade = int(target_value / price)
+            if qty_to_trade <= 0:
                 return None
             side = OrderSide.BUY
 
         elif signal.signal_type == SignalType.SHORT:
-            # Sell to open/increase short
-            target_qty = -int(target_value / price)
-            qty_to_trade = abs(min(0, target_qty - current_qty))
-            if qty_to_trade == 0:
+            max_allowed_value = portfolio_value * self.max_position_pct
+            remaining_value = max(0, max_allowed_value - current_position_value)
+            target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
+
+            qty_to_trade = int(target_value / price)
+            if qty_to_trade <= 0:
                 return None
             side = OrderSide.SELL
 
         elif signal.signal_type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT, SignalType.FLAT):
-            # Close position
+            # Close position — no sizing logic, just close what we have
             if current_qty == 0:
                 return None
             qty_to_trade = abs(current_qty)
             side = OrderSide.SELL if current_qty > 0 else OrderSide.BUY
-
-            # For pairs trading exits, also close the paired position
-            if "pair" in signal.metadata:
-                # This is handled by the execution layer
-                pass
         else:
             return None
 
@@ -173,49 +210,63 @@ class RiskManager:
             quantity=qty_to_trade,
             strategy_name=signal.strategy_name,
             order_id=order_id,
+            timestamp=self._latest_bar_time or datetime.utcnow(),
         )
 
-    def _check_risk(self, order: OrderEvent, signal: SignalEvent) -> tuple:
-        """Run all risk checks. Returns (passed: bool, reason: str)."""
+    def _check_risk(self, order: OrderEvent, signal: SignalEvent, is_exit: bool = False) -> tuple:
+        """Run all risk checks. Returns (passed: bool, reason: str).
+
+        CRITICAL: Exit orders (is_exit=True) ALWAYS pass position size
+        and leverage checks. You must never block a trader from closing
+        a position — that's the opposite of risk management.
+        """
 
         # Check: max open orders
         if len(self._open_orders) >= self.max_open_orders:
             return False, f"Max open orders ({self.max_open_orders}) reached"
 
-        # Check: position size limit
         price = self._latest_prices.get(order.symbol, 0)
         order_value = order.quantity * price
         portfolio_value = self.portfolio.total_value
 
-        if portfolio_value > 0:
-            current_position_value = 0
+        # --- Position size & leverage: SKIP for exits ---
+        if not is_exit and portfolio_value > 0:
+            # For entries: compute what the position WILL be after this order
+            current_qty = 0
             if order.symbol in self.portfolio.positions:
-                current_position_value = abs(self.portfolio.positions[order.symbol].market_value)
+                current_qty = self.portfolio.positions[order.symbol].quantity
 
-            new_position_value = current_position_value + order_value
+            # Compute new position after fill
+            if order.side == OrderSide.BUY:
+                new_qty = current_qty + order.quantity
+            else:
+                new_qty = current_qty - order.quantity
+
+            new_position_value = abs(new_qty * price)
             position_pct = new_position_value / portfolio_value
 
-            if position_pct > self.max_position_pct * 1.1:  # 10% tolerance
+            if position_pct > self.max_position_pct * 1.05:  # 5% tolerance
                 return False, (
-                    f"Position size {position_pct:.1%} exceeds limit "
+                    f"Position size {position_pct:.1%} would exceed limit "
                     f"{self.max_position_pct:.1%} for {order.symbol}"
                 )
 
-        # Check: portfolio leverage
-        total_exposure = sum(
-            abs(p.market_value) for p in self.portfolio.positions.values()
-        ) + order_value
+            # Check: portfolio leverage
+            # Sum all other positions + new position value for this symbol
+            total_exposure = sum(
+                abs(p.market_value) for sym, p in self.portfolio.positions.items()
+                if sym != order.symbol
+            ) + new_position_value
 
-        if portfolio_value > 0:
             leverage = total_exposure / portfolio_value
-            if leverage > self.max_portfolio_leverage * 1.1:
-                return False, f"Portfolio leverage {leverage:.2f} exceeds limit {self.max_portfolio_leverage}"
+            if leverage > self.max_portfolio_leverage * 1.05:
+                return False, f"Portfolio leverage {leverage:.2f} would exceed limit {self.max_portfolio_leverage}"
 
-        # Check: sufficient cash for buys
+        # Check: sufficient cash for buys (applies to both entries and exits of shorts)
         if order.side == OrderSide.BUY:
             required_cash = order_value * 1.01  # 1% buffer for commissions
             if self.portfolio.cash < required_cash:
-                return False, f"Insufficient cash: need {required_cash:.2f}, have {self.portfolio.cash:.2f}"
+                return False, f"Insufficient cash: need ${required_cash:.2f}, have ${self.portfolio.cash:.2f}"
 
         return True, "OK"
 

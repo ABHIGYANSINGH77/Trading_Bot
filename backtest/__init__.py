@@ -168,6 +168,15 @@ class BacktestEngine:
         print(f"  Strategies: {[s.name for s in self.strategies]}")
         print(f"{'='*60}\n")
 
+        # Auto-scale risk limits based on number of symbols
+        self.risk_manager.set_symbols(symbols)
+        print(f"  Risk: max_position_pct = {self.risk_manager.max_position_pct:.0%} "
+              f"({len(symbols)} symbol{'s' if len(symbols)>1 else ''})")
+
+        # Inject interval into strategy params so they can annualize correctly
+        for strategy in self.strategies:
+            strategy.params["interval"] = interval
+
         print(f"Fetching {interval} data for {fetch_symbols}...")
         all_data = self.data_manager.get_data(
             fetch_symbols, start, end, data_source, bar_size
@@ -219,13 +228,34 @@ class BacktestEngine:
         print(f"Done: {bar_count} bars in {elapsed:.2f}s")
 
         # Build results
-        metrics = self.portfolio.calculate_metrics()
+        metrics = self.portfolio.calculate_metrics(interval=interval)
         metrics["elapsed_seconds"] = elapsed
         metrics["total_bars"] = bar_count
-        metrics["interval"] = interval
 
         trade_log = self.portfolio.get_trade_log_df()
         paired_trades = self._pair_trades(trade_log)
+
+        # --- Compute trade-level metrics from paired trades ---
+        if not paired_trades.empty:
+            wins = paired_trades[paired_trades["win"]]
+            losses = paired_trades[~paired_trades["win"]]
+            n_trades = len(paired_trades)
+            gross_wins = wins["net_pnl"].sum() if not wins.empty else 0
+            gross_losses = abs(losses["net_pnl"].sum()) if not losses.empty else 0
+
+            metrics["total_round_trips"] = n_trades
+            metrics["n_wins"] = len(wins)
+            metrics["n_losses"] = len(losses)
+            metrics["win_rate"] = len(wins) / n_trades
+            metrics["profit_factor"] = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+            metrics["expectancy"] = paired_trades["net_pnl"].mean()
+        else:
+            metrics["total_round_trips"] = 0
+            metrics["n_wins"] = 0
+            metrics["n_losses"] = 0
+            metrics["win_rate"] = 0.0
+            metrics["profit_factor"] = 0.0
+            metrics["expectancy"] = 0.0
 
         self._results = {
             "metrics": metrics,
@@ -242,90 +272,166 @@ class BacktestEngine:
         return self._results
 
     def _pair_trades(self, trade_log: pd.DataFrame) -> pd.DataFrame:
-        """Pair entry/exit trades to compute per-trade PnL.
+        """Pair entry/exit fills into round-trip trades.
 
-        This is the key data for understanding strategy performance.
+        Uses net position tracking per symbol. A round-trip starts when
+        position goes from flat to non-flat, and ends when it returns to flat.
+        Handles pyramiding (multiple buys), partial exits, and reversals.
         """
         if trade_log.empty:
             return pd.DataFrame()
 
         paired = []
-        open_positions = {}  # symbol -> entry info
+
+        # Per-symbol state
+        positions = {}  # symbol -> {net_qty, avg_entry, entry_time, side, total_cost, total_commission, strategy}
 
         for _, row in trade_log.iterrows():
             symbol = row["symbol"]
-            side = row["side"]
-            qty = row["quantity"]
-            price = row["price"]
+            side = row["side"]       # "BUY" or "SELL"
+            qty = int(row["quantity"])
+            price = float(row["price"])
             ts = row["timestamp"]
             strategy = row.get("strategy", "")
-            commission = row.get("commission", 0)
+            commission = float(row.get("commission", 0))
 
-            if symbol not in open_positions:
-                # Opening trade
-                open_positions[symbol] = {
+            signed_qty = qty if side == "BUY" else -qty
+
+            if symbol not in positions or positions[symbol]["net_qty"] == 0:
+                # Opening a new position
+                positions[symbol] = {
+                    "net_qty": signed_qty,
+                    "avg_entry": price,
                     "entry_time": ts,
-                    "entry_side": side,
-                    "entry_price": price,
-                    "quantity": qty,
-                    "entry_commission": commission,
+                    "total_cost": abs(signed_qty) * price,
+                    "total_commission": commission,
                     "strategy": strategy,
                 }
             else:
-                # Closing trade
-                entry = open_positions.pop(symbol)
-                if entry["entry_side"] == "BUY":
-                    pnl = (price - entry["entry_price"]) * entry["quantity"]
-                    direction = "LONG"
-                else:
-                    pnl = (entry["entry_price"] - price) * entry["quantity"]
-                    direction = "SHORT"
+                pos = positions[symbol]
+                old_qty = pos["net_qty"]
+                new_qty = old_qty + signed_qty
 
-                total_commission = entry["entry_commission"] + commission
-                net_pnl = pnl - total_commission
-                pnl_pct = (price / entry["entry_price"] - 1) * (1 if direction == "LONG" else -1)
+                pos["total_commission"] += commission
 
-                # Duration
-                try:
-                    duration = (pd.Timestamp(ts) - pd.Timestamp(entry["entry_time"]))
-                    duration_str = str(duration)
-                except Exception:
-                    duration_str = "?"
+                if new_qty == 0:
+                    # Position fully closed — record round-trip
+                    entry_price = pos["avg_entry"]
+                    direction = "LONG" if old_qty > 0 else "SHORT"
 
-                paired.append({
-                    "symbol": symbol,
-                    "direction": direction,
-                    "entry_time": entry["entry_time"],
-                    "entry_price": entry["entry_price"],
-                    "exit_time": ts,
-                    "exit_price": price,
-                    "quantity": entry["quantity"],
-                    "gross_pnl": round(pnl, 2),
-                    "commission": round(total_commission, 2),
-                    "net_pnl": round(net_pnl, 2),
-                    "pnl_pct": round(pnl_pct * 100, 2),
-                    "duration": duration_str,
-                    "strategy": entry["strategy"],
-                    "win": net_pnl > 0,
-                })
+                    if direction == "LONG":
+                        gross_pnl = (price - entry_price) * abs(old_qty)
+                    else:
+                        gross_pnl = (entry_price - price) * abs(old_qty)
+
+                    net_pnl = gross_pnl - pos["total_commission"]
+                    pnl_pct = (price / entry_price - 1) * (1 if direction == "LONG" else -1)
+
+                    try:
+                        duration = pd.Timestamp(ts) - pd.Timestamp(pos["entry_time"])
+                        duration_str = str(duration)
+                    except Exception:
+                        duration_str = "?"
+
+                    paired.append({
+                        "symbol": symbol,
+                        "direction": direction,
+                        "entry_time": pos["entry_time"],
+                        "entry_price": round(entry_price, 4),
+                        "exit_time": ts,
+                        "exit_price": round(price, 4),
+                        "quantity": abs(old_qty),
+                        "gross_pnl": round(gross_pnl, 2),
+                        "commission": round(pos["total_commission"], 2),
+                        "net_pnl": round(net_pnl, 2),
+                        "pnl_pct": round(pnl_pct * 100, 2),
+                        "duration": duration_str,
+                        "strategy": pos["strategy"],
+                        "win": net_pnl > 0,
+                    })
+
+                    # Reset
+                    positions[symbol] = {"net_qty": 0}
+
+                elif (old_qty > 0 and new_qty > 0) or (old_qty < 0 and new_qty < 0):
+                    # Same direction — pyramiding. Update avg entry.
+                    if (signed_qty > 0 and old_qty > 0) or (signed_qty < 0 and old_qty < 0):
+                        pos["total_cost"] += abs(signed_qty) * price
+                        pos["avg_entry"] = pos["total_cost"] / abs(new_qty)
+                    pos["net_qty"] = new_qty
+
+                elif (old_qty > 0 and new_qty < 0) or (old_qty < 0 and new_qty > 0):
+                    # Position reversed through zero — close old, open new
+                    entry_price = pos["avg_entry"]
+                    direction = "LONG" if old_qty > 0 else "SHORT"
+                    closed_qty = abs(old_qty)
+
+                    if direction == "LONG":
+                        gross_pnl = (price - entry_price) * closed_qty
+                    else:
+                        gross_pnl = (entry_price - price) * closed_qty
+
+                    # Attribute half the commission to this round-trip
+                    trip_commission = pos["total_commission"] * 0.5
+                    net_pnl = gross_pnl - trip_commission
+                    pnl_pct = (price / entry_price - 1) * (1 if direction == "LONG" else -1)
+
+                    try:
+                        duration = pd.Timestamp(ts) - pd.Timestamp(pos["entry_time"])
+                        duration_str = str(duration)
+                    except Exception:
+                        duration_str = "?"
+
+                    paired.append({
+                        "symbol": symbol,
+                        "direction": direction,
+                        "entry_time": pos["entry_time"],
+                        "entry_price": round(entry_price, 4),
+                        "exit_time": ts,
+                        "exit_price": round(price, 4),
+                        "quantity": closed_qty,
+                        "gross_pnl": round(gross_pnl, 2),
+                        "commission": round(trip_commission, 2),
+                        "net_pnl": round(net_pnl, 2),
+                        "pnl_pct": round(pnl_pct * 100, 2),
+                        "duration": duration_str,
+                        "strategy": pos["strategy"],
+                        "win": net_pnl > 0,
+                    })
+
+                    # Open the new reversed position
+                    positions[symbol] = {
+                        "net_qty": new_qty,
+                        "avg_entry": price,
+                        "entry_time": ts,
+                        "total_cost": abs(new_qty) * price,
+                        "total_commission": trip_commission,
+                        "strategy": strategy,
+                    }
 
         return pd.DataFrame(paired) if paired else pd.DataFrame()
 
     def print_results(self) -> None:
-        """Pretty print backtest results."""
+        """Pretty print backtest results.
+
+        Portfolio-level metrics (Sharpe, vol, drawdown) come from portfolio.calculate_metrics().
+        Trade-level metrics (win rate, profit factor, expectancy) are computed here
+        from paired_trades — the actual round-trip trade records.
+        """
         if not self._results:
             print("No results. Run backtest first.")
             return
 
         m = self._results["metrics"]
         paired = self._results["paired_trades"]
+        strat_names = ", ".join(s.name for s in self.strategies)
 
         print(f"\n{'='*60}")
-        print(f"  BACKTEST RESULTS")
+        print(f"  BACKTEST RESULTS — {strat_names}")
         print(f"{'='*60}")
-        print(f"  Interval:              {self._results.get('interval', '?'):>14}")
+        print(f"  Interval:              {m.get('interval', '?'):>14}")
         print(f"  Total Bars:            {m.get('total_bars', 0):>14,}")
-        print(f"  Initial Capital:       ${self.portfolio.initial_capital:>13,.2f}")
+        print(f"  Initial Capital:       ${m.get('initial_capital', 0):>13,.2f}")
         print(f"  Final Value:           ${m.get('final_value', 0):>13,.2f}")
         print(f"  Total Return:          {m.get('total_return', 0):>14.2%}")
         print(f"  Annualized Return:     {m.get('annualized_return', 0):>14.2%}")
@@ -336,43 +442,66 @@ class BacktestEngine:
         print(f"  Total Commission:      ${m.get('total_commission', 0):>13,.2f}")
         print(f"{'='*60}")
 
+        # --- Trade-level analysis from paired_trades ---
         if not paired.empty:
+            total_trades = len(paired)
             wins = paired[paired["win"]]
             losses = paired[~paired["win"]]
-            total_trades = len(paired)
-            win_rate = len(wins) / total_trades if total_trades > 0 else 0
-            avg_win = wins["net_pnl"].mean() if not wins.empty else 0
-            avg_loss = losses["net_pnl"].mean() if not losses.empty else 0
-            profit_factor = (
-                abs(wins["net_pnl"].sum() / losses["net_pnl"].sum())
-                if not losses.empty and losses["net_pnl"].sum() != 0 else float("inf")
-            )
-            expectancy = paired["net_pnl"].mean()
-            max_win = paired["net_pnl"].max()
-            max_loss = paired["net_pnl"].min()
-            avg_duration = paired["duration"].iloc[0] if len(paired) == 1 else "varies"
+            n_wins = len(wins)
+            n_losses = len(losses)
+
+            win_rate = n_wins / total_trades
+            avg_win_pct = wins["pnl_pct"].mean() if not wins.empty else 0
+            avg_loss_pct = losses["pnl_pct"].mean() if not losses.empty else 0
+            avg_win_dollar = wins["net_pnl"].mean() if not wins.empty else 0
+            avg_loss_dollar = losses["net_pnl"].mean() if not losses.empty else 0
+
+            gross_wins = wins["net_pnl"].sum() if not wins.empty else 0
+            gross_losses = abs(losses["net_pnl"].sum()) if not losses.empty else 0
+            profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+            expectancy_dollar = paired["net_pnl"].mean()
+            expectancy_pct = paired["pnl_pct"].mean()
+            best_pct = paired["pnl_pct"].max()
+            worst_pct = paired["pnl_pct"].min()
+            best_dollar = paired["net_pnl"].max()
+            worst_dollar = paired["net_pnl"].min()
+            total_net = paired["net_pnl"].sum()
+
+            # Inject trade-level metrics into results for export
+            # (already computed in run(), but update if print_results is called standalone)
+            m.update({
+                "win_rate": win_rate,
+                "profit_factor": profit_factor,
+                "expectancy": expectancy_dollar,
+                "total_round_trips": total_trades,
+                "n_wins": n_wins,
+                "n_losses": n_losses,
+            })
 
             print(f"\n  TRADE ANALYSIS ({total_trades} round-trip trades)")
             print(f"  {'-'*56}")
-            print(f"  Win Rate:              {win_rate:>14.1%}")
-            print(f"  Avg Win:               ${avg_win:>13,.2f}")
-            print(f"  Avg Loss:              ${avg_loss:>13,.2f}")
+            print(f"  Win Rate:              {win_rate:>13.1%}  ({n_wins}W / {n_losses}L)")
+            print(f"  Avg Win:                {avg_win_pct:>+12.2f}%  (${avg_win_dollar:>+10,.2f})")
+            print(f"  Avg Loss:               {avg_loss_pct:>+12.2f}%  (${avg_loss_dollar:>+10,.2f})")
             print(f"  Profit Factor:         {profit_factor:>14.2f}")
-            print(f"  Expectancy:            ${expectancy:>13,.2f}")
-            print(f"  Best Trade:            ${max_win:>13,.2f}")
-            print(f"  Worst Trade:           ${max_loss:>13,.2f}")
-            print(f"  Total P&L:             ${paired['net_pnl'].sum():>13,.2f}")
+            print(f"  Expectancy:             {expectancy_pct:>+12.2f}%  (${expectancy_dollar:>+10,.2f})")
+            print(f"  Best Trade:             {best_pct:>+12.2f}%  (${best_dollar:>+10,.2f})")
+            print(f"  Worst Trade:            {worst_pct:>+12.2f}%  (${worst_dollar:>+10,.2f})")
+            print(f"  Net P&L:               ${total_net:>13,.2f}")
 
-            print(f"\n  {'Symbol':<6} {'Dir':<5} {'Entry':>10} {'Exit':>10} {'P&L':>10} {'P&L%':>7} {'Duration'}")
-            print(f"  {'-'*70}")
+            print(f"\n  {'Symbol':<6} {'Dir':<6} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
+            print(f"  {'-'*72}")
             for _, t in paired.iterrows():
-                color = "+" if t["win"] else "-"
+                marker = "✓" if t["win"] else "✗"
                 print(
-                    f"  {t['symbol']:<6} {t['direction']:<5} "
+                    f"  {t['symbol']:<6} {t['direction']:<6} "
                     f"${t['entry_price']:>9,.2f} ${t['exit_price']:>9,.2f} "
-                    f"${t['net_pnl']:>9,.2f} {t['pnl_pct']:>6.1f}% "
-                    f"{t['duration']}"
+                    f"{t['pnl_pct']:>+7.2f}% ${t['net_pnl']:>9,.2f} "
+                    f"{t['duration']}  {marker}"
                 )
+        else:
+            print("\n  No round-trip trades completed.")
 
         print(f"{'='*60}")
 
@@ -385,6 +514,11 @@ class BacktestEngine:
             for r in risk_log:
                 if r.get("action") == "REJECTED":
                     print(f"    REJECTED: {r.get('detail', '?')} | {r.get('symbol', '?')}")
+
+        # Strategy signal funnels
+        for strategy in self.strategies:
+            if hasattr(strategy, "print_funnel"):
+                strategy.print_funnel()
 
     def plot_results(self, save_path: str = None) -> str:
         """Generate performance charts."""
@@ -536,22 +670,49 @@ class BacktestEngine:
                     "timestamp": str(row["timestamp"]),
                 })
 
-        # Paired trades
+        # Paired trades — include bar indices for visualizer
         paired_list = []
         paired = self._results["paired_trades"]
         if not paired.empty:
             for _, t in paired.iterrows():
+                # Find bar indices for entry and exit
+                symbol = t["symbol"]
+                entry_idx = 0
+                exit_idx = 0
+                if symbol in self._bar_data:
+                    df = self._bar_data[symbol]
+                    df_idx = df.index.tz_localize(None) if df.index.tz else df.index
+
+                    try:
+                        et = pd.Timestamp(t["entry_time"])
+                        et = et.tz_localize(None) if et.tzinfo else et
+                        entry_idx = int(df_idx.get_indexer([et], method="nearest")[0])
+                    except Exception:
+                        entry_idx = 0
+
+                    try:
+                        xt = pd.Timestamp(t["exit_time"])
+                        xt = xt.tz_localize(None) if xt.tzinfo else xt
+                        exit_idx = int(df_idx.get_indexer([xt], method="nearest")[0])
+                    except Exception:
+                        exit_idx = entry_idx + 1
+
                 paired_list.append({
                     "symbol": t["symbol"],
                     "direction": t["direction"],
                     "entry_time": str(t["entry_time"]),
-                    "entry_price": t["entry_price"],
+                    "entry_price": round(float(t["entry_price"]), 4),
                     "exit_time": str(t["exit_time"]),
-                    "exit_price": t["exit_price"],
+                    "exit_price": round(float(t["exit_price"]), 4),
+                    "entry_index": entry_idx,
+                    "exit_index": exit_idx,
                     "quantity": int(t["quantity"]),
-                    "net_pnl": t["net_pnl"],
-                    "pnl_pct": t["pnl_pct"],
-                    "duration": t["duration"],
+                    "gross_pnl": round(float(t.get("gross_pnl", 0)), 2),
+                    "net_pnl": round(float(t["net_pnl"]), 2),
+                    "pnl_pct": round(float(t["pnl_pct"]), 2),
+                    "commission": round(float(t.get("commission", 0)), 2),
+                    "duration": str(t["duration"]),
+                    "strategy": t.get("strategy", ""),
                     "win": bool(t["win"]),
                 })
 

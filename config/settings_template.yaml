@@ -1,3 +1,77 @@
+# # QuantBot Configuration
+# # Copy this file to settings.yaml and edit with your details
+
+# broker:
+#   host: "127.0.0.1"
+#   port: 7497          # 7497 for TWS paper, 4002 for IB Gateway paper
+#   client_id: 1
+#   account: "DUO632926"         # Your IBKR paper account ID (e.g., DU1234567)
+#   timeout: 30
+
+# data:
+#   # Where to cache downloaded historical data
+#   cache_dir: "./data/cache"
+#   # Default bar size for historical data
+#   default_bar_size: "1 day"
+#   # How far back to fetch (for daily bars)
+#   default_lookback: "2 Y"
+
+# trading:
+#   mode: "paper"        # paper | live (DO NOT use live without thorough testing)
+#   universe:            # Symbols to trade
+#     - "SPY"
+#     - "IWM"
+#     - "QQQ"
+#     - "DIA"
+#     - "EFA"
+#   base_currency: "USD"
+
+# risk:
+#   max_position_pct: 0.20       # Max 20% of portfolio in single position
+#   max_portfolio_leverage: 1.0   # No leverage to start
+#   max_daily_drawdown_pct: 0.02  # Stop trading if down 2% in a day
+#   max_total_drawdown_pct: 0.10  # Stop trading if down 10% from peak
+#   max_open_orders: 10
+#   max_correlation: 0.85         # Warn if positions too correlated
+
+# backtest:
+#   initial_capital: 100000.0
+#   commission_per_share: 0.005   # IBKR tiered pricing approx
+#   min_commission: 1.0
+#   slippage_pct: 0.001           # 0.1% slippage estimate
+#   start_date: "2022-01-01"
+#   end_date: "2024-12-31"
+
+# strategies:
+#   pairs_trading:
+#     lookback_period: 60         # Days for cointegration/z-score calc
+#     entry_z: 2.0                # Enter when z-score exceeds this
+#     exit_z: 0.5                 # Exit when z-score reverts to this
+#     stop_z: 3.5                 # Stop loss z-score
+#     pair:
+#       - "SPY"
+#       - "IWM"
+#     hedge_ratio_method: "ols"   # ols | rolling
+
+#   ma_crossover:
+#     fast_period: 20
+#     slow_period: 50
+#     vol_lookback: 30            # Lookback for volatility regime
+#     vol_threshold: 0.20         # Annualized vol threshold for regime switch
+#     symbols:
+#       - "SPY"
+#       - "QQQ"
+
+# logging:
+#   level: "INFO"                 # DEBUG | INFO | WARNING | ERROR
+#   log_file: "./logs/quantbot.log"
+#   rotation: "10 MB"
+
+# dashboard:
+#   host: "127.0.0.1"
+#   port: 8050
+#   refresh_interval: 5           # Seconds between dashboard updates
+
 # QuantBot Configuration
 # Copy this file to settings.yaml and edit with your details
 
@@ -17,13 +91,15 @@ data:
   default_lookback: "2 Y"
 
 trading:
-  mode: "paper"        # paper | live (DO NOT use live without thorough testing)
-  universe:            # Symbols to trade
-    - "SPY"
-    - "IWM"
-    - "QQQ"
-    - "DIA"
-    - "EFA"
+  mode: "paper"        # paper | simulate | backtest
+  # Asset type: STK for stocks/ETFs, FX for forex
+  asset_type: "STK"
+  universe:
+    - "AAPL"
+    - "MSFT"
+    - "NVDA"
+    - "GOOG"
+    - "AMZN"
   base_currency: "USD"
 
 risk:
@@ -48,19 +124,40 @@ strategies:
     entry_z: 2.0                # Enter when z-score exceeds this
     exit_z: 0.5                 # Exit when z-score reverts to this
     stop_z: 3.5                 # Stop loss z-score
+    # Good stock pairs (high correlation, potential cointegration):
+    #   AAPL/MSFT  - mega-cap tech
+    #   GOOG/META  - ad-driven tech
+    #   NVDA/AMD   - semiconductor
+    #   V/MA       - payment networks
+    #   KO/PEP     - beverages
     pair:
-      - "SPY"
-      - "IWM"
+      - "AAPL"
+      - "MSFT"
     hedge_ratio_method: "ols"   # ols | rolling
 
   ma_crossover:
     fast_period: 20
     slow_period: 50
     vol_lookback: 30            # Lookback for volatility regime
-    vol_threshold: 0.20         # Annualized vol threshold for regime switch
+    vol_threshold: 0.30         # Annualized vol threshold for regime switch
     symbols:
-      - "SPY"
-      - "QQQ"
+      - "NVDA"
+      - "AAPL"
+
+  bos:
+    symbols:
+      - "AAPL"
+      - "NVDA"
+    swing_lookback: 5           # Bars for swing high/low detection
+    min_bars: 60                # Warmup bars before trading
+    rvol_threshold: 1.2         # Min relative volume for confirmation
+    rsi_oversold: 30
+    rsi_overbought: 70
+    atr_period: 14              # ATR period for stop sizing
+    risk_reward: 2.0            # Take profit = 2x stop distance
+    pullback_pct: 0.3           # Wait for 30% pullback before entry
+    use_volume_filter: true     # Require volume confirmation
+    use_vwap_filter: true       # Require VWAP alignment
 
 logging:
   level: "INFO"                 # DEBUG | INFO | WARNING | ERROR
