@@ -806,6 +806,43 @@ def backtest(strategy, start, end, interval, source, config):
 
 
 @cli.command()
+@click.option("--strategy", "-s", required=True, help="Strategy name (bos, ma_crossover)")
+@click.option("--start", default=None, help="Start date YYYY-MM-DD")
+@click.option("--end", default=None, help="End date YYYY-MM-DD")
+@click.option("--interval", "-i", default="15m", help="Bar interval: 5m, 15m, 30m, 1h, 1d")
+@click.option("--source", "-d", default="yfinance", type=click.Choice(["yfinance", "ibkr"]),
+              help="Data source")
+@click.option("--windows", "-w", default=3, help="Walk-forward windows (default: 3)")
+@click.option("--mc", default=1000, help="Monte Carlo simulations (default: 1000)")
+@click.option("--config", "-c", default=None, help="Config file path")
+def validate(strategy, start, end, interval, source, windows, mc, config):
+    """Validate strategy: walk-forward + out-of-sample + Monte Carlo.
+
+    \b
+    Examples:
+        python main.py validate -s bos -i 15m -d ibkr --start 2025-01-01 --end 2025-12-31
+        python main.py validate -s ma_crossover -i 1h -d ibkr --start 2025-06-01 --end 2026-01-01
+        python main.py validate -s bos -i 15m --windows 5 --mc 2000
+    """
+    cfg = load_config(config)
+
+    if source == "ibkr":
+        ibkr_cfg = cfg.get("ibkr", {})
+
+    from backtest.validate import run_validation
+    run_validation(
+        config=cfg,
+        strategy_name=strategy,
+        start=start or "2025-01-01",
+        end=end or "2025-12-31",
+        interval=interval,
+        data_source=source,
+        n_walk_forward=windows,
+        mc_simulations=mc,
+    )
+
+
+@cli.command()
 @click.option("--strategy", "-s", required=True, help="Strategy name")
 @click.option("--interval", "-i", default=30, help="Poll interval seconds (default: 30)")
 @click.option("--warmup", "-w", default=90, help="Warmup days of history (default: 90)")
