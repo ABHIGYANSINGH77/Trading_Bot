@@ -1,6 +1,6 @@
 """Break of Structure (BOS) Strategy v2 — With Regime Detection.
 
-Improvements over v1:
+Improvements over initial bos strategy:
   1. REGIME FILTER: Only trades when ADX-style trend strength is sufficient.
      Sits in cash during ranging/choppy markets (where v1 lost all its money).
 
