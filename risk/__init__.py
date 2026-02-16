@@ -49,6 +49,16 @@ class RiskManager:
         self.max_total_drawdown_pct = risk_config.get("max_total_drawdown_pct", 0.25)  # 25%
         self.max_open_orders = risk_config.get("max_open_orders", 10)
 
+        # --- Position sizing controls ---
+        # Minimum order value — trades below this aren't worth the commission
+        # At $1 min commission, a $200 trade costs 0.5% in commission alone
+        self.min_order_value = risk_config.get("min_order_value", 500.0)
+
+        # Risk per trade — max % of portfolio risked on any single trade
+        # This is the prop firm standard: risk 2-5% of capital per trade
+        # If stop loss is 2% away, position size = (portfolio * risk_pct) / stop_distance
+        self.risk_per_trade_pct = risk_config.get("risk_per_trade_pct", 0.03)  # 3%
+
         # State tracking
         self._daily_start_value: Optional[float] = None
         self._current_date: Optional[date] = None
@@ -61,29 +71,35 @@ class RiskManager:
         self._risk_log = []
         self._symbols: List[str] = []
 
+        # Track signal metadata (stop/target) for visualizer
+        # Maps order_id → signal metadata dict
+        self._signal_metadata: Dict[str, Dict] = {}
+
         # Subscribe to events
         self.event_bus.subscribe(EventType.SIGNAL, self.on_signal)
         self.event_bus.subscribe(EventType.MARKET_DATA, self.on_market_data)
         self.event_bus.subscribe(EventType.FILL, self.on_fill)
 
     def set_symbols(self, symbols: list):
-        """Auto-scale position limits based on number of symbols.
-
-        For single-stock backtests, 20% is nonsensical — you'd use 80-90%
-        of capital. For multi-stock portfolios, smaller limits keep
-        diversification. This ALWAYS overrides config because position
-        sizing must match the actual trading universe.
-        """
+        """Auto-scale position limits based on number of symbols."""
         self._symbols = symbols
         n = len(symbols)
         if n <= 1:
             self.max_position_pct = 0.90  # Single stock: use up to 90%
         elif n == 2:
-            self.max_position_pct = 0.50  # Two stocks: 50% each max
+            self.max_position_pct = 0.50
         elif n <= 5:
             self.max_position_pct = 0.30
         else:
             self.max_position_pct = 0.20  # 6+: standard diversification
+
+        # For small accounts, reduce min order value proportionally
+        portfolio_value = self.portfolio.initial_capital if hasattr(self.portfolio, 'initial_capital') else 10000
+        if hasattr(self.portfolio, 'initial_capital'):
+            portfolio_value = self.portfolio.initial_capital
+        # Min order = at least 5% of portfolio, so you don't have too many micro-positions
+        # But never below $200 (commission floor)
+        self.min_order_value = max(200, portfolio_value * 0.05)
 
     def on_market_data(self, event: MarketDataEvent) -> None:
         """Track prices, bar timestamps, and check daily drawdown."""
@@ -154,6 +170,8 @@ class RiskManager:
 
         if passed:
             self._open_orders[order.order_id] = order
+            # Store signal metadata (stop, target, etc.) for visualizer
+            self._signal_metadata[order.order_id] = signal.metadata.copy()
             self.event_bus.publish(order)
             self._log_risk_event("APPROVED", order.symbol, signal.strategy_name,
                                  f"{order.side.value} {order.quantity} {order.symbol} "
@@ -165,8 +183,16 @@ class RiskManager:
     def _signal_to_order(self, signal: SignalEvent) -> Optional[OrderEvent]:
         """Convert a signal event to an order event with proper sizing.
 
-        Position sizing is unified here — we compute the max allowed quantity
-        based on risk limits so the order is ALWAYS within bounds.
+        Position sizing uses TWO methods and takes the smaller:
+
+        1. POSITION LIMIT: max_position_pct of portfolio (e.g., 90% for single stock)
+        2. RISK-PER-TRADE: if signal has stop_loss in metadata, size so that
+           hitting the stop loses at most risk_per_trade_pct of portfolio (e.g., 3%)
+
+        This mimics how prop firms size: "I'm willing to lose 3% of my capital
+        on this trade, and my stop is 1.5% away, so I can buy X shares."
+
+        Also enforces minimum order value to avoid commission-eaten tiny trades.
         """
         symbol = signal.symbol
         price = self._latest_prices.get(symbol, 0)
@@ -186,16 +212,27 @@ class RiskManager:
             current_position_value = abs(current_qty * price)
 
         if signal.signal_type == SignalType.LONG:
-            # How much room do we have within the position limit?
+            # Method 1: Position limit
             max_allowed_value = portfolio_value * self.max_position_pct
             remaining_value = max(0, max_allowed_value - current_position_value)
-
-            # Scale by signal strength
             target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
 
-            # Never exceed available cash (keep 5% buffer for commissions)
+            # Method 2: Risk-per-trade (if stop loss provided in signal metadata)
+            stop_price = signal.metadata.get("stop")
+            if stop_price and stop_price > 0 and stop_price < price:
+                stop_distance_pct = (price - stop_price) / price
+                if stop_distance_pct > 0.001:  # Avoid division by tiny stop
+                    risk_budget = portfolio_value * self.risk_per_trade_pct
+                    risk_based_value = risk_budget / stop_distance_pct
+                    target_value = min(target_value, risk_based_value)
+
+            # Never exceed available cash (keep 5% buffer)
             available_cash = self.portfolio.cash * 0.95
             target_value = min(target_value, available_cash)
+
+            # Enforce minimum order value
+            if target_value < self.min_order_value:
+                return None
 
             qty_to_trade = int(target_value / price)
             if qty_to_trade <= 0:
@@ -206,6 +243,19 @@ class RiskManager:
             max_allowed_value = portfolio_value * self.max_position_pct
             remaining_value = max(0, max_allowed_value - current_position_value)
             target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
+
+            # Risk-per-trade for shorts
+            stop_price = signal.metadata.get("stop")
+            if stop_price and stop_price > 0 and stop_price > price:
+                stop_distance_pct = (stop_price - price) / price
+                if stop_distance_pct > 0.001:
+                    risk_budget = portfolio_value * self.risk_per_trade_pct
+                    risk_based_value = risk_budget / stop_distance_pct
+                    target_value = min(target_value, risk_based_value)
+
+            # Enforce minimum order value
+            if target_value < self.min_order_value:
+                return None
 
             qty_to_trade = int(target_value / price)
             if qty_to_trade <= 0:
@@ -326,6 +376,11 @@ class RiskManager:
     @property
     def risk_log(self):
         return self._risk_log.copy()
+
+    @property
+    def signal_metadata(self) -> Dict[str, Dict]:
+        """Signal metadata (stop/target) keyed by order_id."""
+        return self._signal_metadata
 
     def get_status(self) -> Dict:
         """Current risk status summary."""
