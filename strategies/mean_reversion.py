@@ -21,17 +21,21 @@ When ADX > 25 (trending), it sits in cash and lets BOS/MA Crossover work.
 
 from collections import defaultdict
 from typing import Dict, Optional
+
 import numpy as np
+
 from core.events import EventBus, EventType, MarketDataEvent, SignalEvent, SignalType
 from strategies import BaseStrategy
 from features import atr, rsi, bollinger_bands
 
+
 def _adx(high, low, close, period=14):
-    """ADX Calculation (same as BOS)."""
+    """ADX calculation (same as BOS v2)."""
     n = len(close)
     adx_vals = np.full(n, np.nan)
-    if n< period * 2 + 1:
+    if n < period * 2 + 1:
         return adx_vals
+
     tr = np.zeros(n)
     tr[0] = high[0] - low[0]
     for i in range(1, n):

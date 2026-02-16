@@ -22,8 +22,6 @@ Exit:
   - Stop: opposite Bollinger Band at entry time
   - Target: 2x the Bollinger bandwidth at entry
   - Trailing stop after 1.5 ATR profit
-
-  The Scope of this can be expanded with Machine Learning by using a classifier to predict breakout direction based on features (future prospect of the bot).
 """
 
 from collections import defaultdict
@@ -55,7 +53,7 @@ class VolatilityBreakoutStrategy(BaseStrategy):
 
     def __init__(self, event_bus: EventBus, params: dict = None):
         default_params = {
-            "symbols": ["AAPL"],  # Testing single stock, this can be changed or expanded to multiple stocks.
+            "symbols": ["AAPL"],
             "bb_period": 20,
             "bb_std": 2.0,
             "squeeze_percentile": 20,
