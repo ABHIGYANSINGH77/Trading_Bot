@@ -331,12 +331,18 @@ class PairsTradingStrategy(BaseStrategy):
 # Import strategies from their own modules
 from strategies.bos_strategy import BOSStrategy
 from strategies.ma_crossover import MACrossoverStrategy
+from strategies.mean_reversion import MeanReversionStrategy
+from strategies.vol_breakout import VolatilityBreakoutStrategy
+from strategies.ensemble import EnsembleStrategy
 
 # Strategy registry for easy lookup
 STRATEGY_REGISTRY = {
     "pairs_trading": PairsTradingStrategy,
     "ma_crossover": MACrossoverStrategy,
     "bos": BOSStrategy,
+    "mean_reversion": MeanReversionStrategy,
+    "vol_breakout": VolatilityBreakoutStrategy,
+    "ensemble": EnsembleStrategy,
 }
 
 
