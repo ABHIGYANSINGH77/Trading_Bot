@@ -222,6 +222,7 @@ class Portfolio:
             "price": price,
             "commission": commission,
             "strategy": event.strategy_name,
+            "order_id": event.order_id,
             "cash_after": self.cash,
             "portfolio_value": self.total_value,
         })
