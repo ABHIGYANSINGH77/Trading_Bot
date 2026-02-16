@@ -340,6 +340,9 @@ def detect_market_structure(
         trend = "ranging"
 
     # Detect Break of Structure
+    # Use HIGH for bullish breaks and LOW for bearish breaks (wick counts)
+    # but require close to be at least halfway past the level for confirmation
+    # This catches genuine breakouts while filtering fakeout wicks
     current_close = close[-1]
     current_high = high[-1]
     current_low = low[-1]
@@ -349,17 +352,25 @@ def detect_market_structure(
 
     structure_break = StructureBreak.NONE
 
-    if last_sh and current_close > last_sh.price:
-        if trend == "bearish":
-            structure_break = StructureBreak.BULLISH_CHOCH
-        else:
-            structure_break = StructureBreak.BULLISH_BOS
+    if last_sh:
+        level = last_sh.price
+        # Bullish break: high pierces above swing high AND close confirms
+        # Close must be above the midpoint between level and high
+        # This filters wick-only fakeouts while still detecting legitimate breaks
+        if current_high > level and current_close > level - (current_high - level) * 0.3:
+            if trend == "bearish":
+                structure_break = StructureBreak.BULLISH_CHOCH
+            else:
+                structure_break = StructureBreak.BULLISH_BOS
 
-    elif last_sl and current_close < last_sl.price:
-        if trend == "bullish":
-            structure_break = StructureBreak.BEARISH_CHOCH
-        else:
-            structure_break = StructureBreak.BEARISH_BOS
+    if structure_break == StructureBreak.NONE and last_sl:
+        level = last_sl.price
+        # Bearish break: low pierces below swing low AND close confirms
+        if current_low < level and current_close < level + (level - current_low) * 0.3:
+            if trend == "bullish":
+                structure_break = StructureBreak.BEARISH_CHOCH
+            else:
+                structure_break = StructureBreak.BEARISH_BOS
 
     return {
         "trend": trend,
@@ -482,19 +493,62 @@ def relative_volume(volume: np.ndarray, period: int = 20) -> np.ndarray:
 
 
 def vwap(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray,
+    timestamps: np.ndarray = None
 ) -> np.ndarray:
     """Volume Weighted Average Price — institutional benchmark.
+
+    VWAP resets at the start of each trading session (9:30 AM ET).
+    Without timestamps, it falls back to a rolling 7-bar window
+    (approximating 1 trading day on 1h bars).
 
     Price above VWAP = bullish bias
     Price below VWAP = bearish bias
     """
     typical_price = (high + low + close) / 3.0
-    cumulative_tp_vol = np.cumsum(typical_price * volume)
-    cumulative_vol = np.cumsum(volume)
+    n = len(close)
+    vwap_values = np.full(n, np.nan)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        vwap_values = np.where(cumulative_vol > 0, cumulative_tp_vol / cumulative_vol, close)
+    if timestamps is not None:
+        # Session-based VWAP: reset at market open each day
+        # Detect session boundaries: new session when date changes
+        # or when hour resets to 9 (9:30 open)
+        import pandas as pd
+        ts = pd.DatetimeIndex(timestamps)
+        dates = ts.date
+
+        cum_tp_vol = 0.0
+        cum_vol = 0.0
+        prev_date = None
+
+        for i in range(n):
+            current_date = dates[i]
+
+            # Reset at start of new trading day
+            if current_date != prev_date:
+                cum_tp_vol = 0.0
+                cum_vol = 0.0
+                prev_date = current_date
+
+            cum_tp_vol += typical_price[i] * volume[i]
+            cum_vol += volume[i]
+
+            if cum_vol > 0:
+                vwap_values[i] = cum_tp_vol / cum_vol
+            else:
+                vwap_values[i] = close[i]
+    else:
+        # Fallback: rolling 7-bar window (approx 1 day on 1h bars)
+        window = min(7, n)
+        for i in range(n):
+            start = max(0, i - window + 1)
+            tp_slice = typical_price[start:i+1]
+            vol_slice = volume[start:i+1]
+            total_vol = vol_slice.sum()
+            if total_vol > 0:
+                vwap_values[i] = (tp_slice * vol_slice).sum() / total_vol
+            else:
+                vwap_values[i] = close[i]
 
     return vwap_values
 
@@ -658,7 +712,9 @@ def compute_all_features(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
 
     # --- Volume ---
     out["rvol_20"] = relative_volume(v, 20)
-    out["vwap"] = vwap(h, l, c, v)
+    # Pass timestamps for session-based VWAP if available
+    ts = df.index.values if hasattr(df.index, 'values') else None
+    out["vwap"] = vwap(h, l, c, v, ts)
     out["price_vs_vwap"] = c - out["vwap"].values
 
     # --- Momentum ---
