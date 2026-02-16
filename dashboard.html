@@ -148,7 +148,11 @@ function drawChart(){
       x.beginPath();x.moveTo(x1,y1);x.lineTo(x2,y2);x.stroke();x.setLineDash([]);
       const pnl=pt.pnl_pct||0;
       x.font="bold 9px 'JetBrains Mono'";x.textAlign="center";x.fillStyle=pt.win?"#22c55e":"#ef4444";
-      x.fillText((pnl>=0?"+":"")+pnl.toFixed(1)+"%",(x1+x2)/2,zt-4)})}
+      x.fillText((pnl>=0?"+":"")+pnl.toFixed(1)+"%",(x1+x2)/2,zt-4);
+      // Draw stop loss and take profit lines if available
+      if(pt.stop){const ys=py(pt.stop);x.strokeStyle="rgba(239,68,68,.6)";x.lineWidth=1;x.setLineDash([4,3]);x.beginPath();x.moveTo(x1,ys);x.lineTo(x2,ys);x.stroke();x.setLineDash([]);x.font="7px 'JetBrains Mono'";x.fillStyle="rgba(239,68,68,.7)";x.textAlign="left";x.fillText("SL $"+pt.stop.toFixed(1),x1+2,ys-3)}
+      if(pt.target){const yt=py(pt.target);x.strokeStyle="rgba(34,197,94,.6)";x.lineWidth=1;x.setLineDash([4,3]);x.beginPath();x.moveTo(x1,yt);x.lineTo(x2,yt);x.stroke();x.setLineDash([]);x.font="7px 'JetBrains Mono'";x.fillStyle="rgba(34,197,94,.7)";x.textAlign="left";x.fillText("TP $"+pt.target.toFixed(1),x1+2,yt-3)}
+      })}
     // Signal markers
     vs.forEach(sg=>{
       const xp=px(sg.index),b=D.bars[sg.index],isBuy=sg.type==="buy",pr=sg.price||b.close;
