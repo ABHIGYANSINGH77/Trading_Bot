@@ -178,7 +178,9 @@ class BacktestEngine:
         # Auto-scale risk limits based on number of symbols
         self.risk_manager.set_symbols(symbols)
         print(f"  Risk: max_position_pct = {self.risk_manager.max_position_pct:.0%} "
-              f"({len(symbols)} symbol{'s' if len(symbols)>1 else ''})")
+              f"({len(symbols)} symbol{'s' if len(symbols)>1 else ''}) | "
+              f"risk/trade = {self.risk_manager.risk_per_trade_pct:.0%} | "
+              f"min order = ${self.risk_manager.min_order_value:.0f}")
 
         # Inject interval into strategy params so they can annualize correctly
         for strategy in self.strategies:
@@ -198,6 +200,36 @@ class BacktestEngine:
             self._benchmark_data = all_data[benchmark]
 
         strategy_data = {s: all_data[s] for s in symbols if s in all_data}
+
+        # Clean data — filter bad ticks at the DataFrame level
+        for sym in list(strategy_data.keys()):
+            df = strategy_data[sym]
+            if df.empty:
+                continue
+            orig_len = len(df)
+
+            # Check all OHLC columns for >15% single-bar jumps
+            closes = df["close"].values
+            mask = np.ones(len(df), dtype=bool)
+            for i in range(1, len(df)):
+                prev_c = closes[i-1]
+                if prev_c <= 0:
+                    continue
+                for col in ["open", "high", "low", "close"]:
+                    change = abs(df[col].iloc[i] - prev_c) / prev_c
+                    if change > 0.15:
+                        mask[i] = False
+                        print(f"  ⚠ Bad tick: {sym} @ {df.index[i]} — "
+                              f"O={df['open'].iloc[i]:.2f} H={df['high'].iloc[i]:.2f} "
+                              f"L={df['low'].iloc[i]:.2f} C={df['close'].iloc[i]:.2f} "
+                              f"(prev close={prev_c:.2f}, Δ={change:.0%})")
+                        break
+
+            if not mask.all():
+                strategy_data[sym] = df[mask].copy()
+                removed = orig_len - len(strategy_data[sym])
+                print(f"  ⚠ Filtered {removed} bad tick(s) from {sym}")
+
         self._bar_data = strategy_data
 
         for s, df in strategy_data.items():
@@ -212,6 +244,39 @@ class BacktestEngine:
             for timestamp, row in df.iterrows():
                 events.append((timestamp, symbol, row))
         events.sort(key=lambda x: x[0])
+
+        # Filter bad ticks — erroneous data points from IBKR
+        # Check ALL price fields (open, high, low, close) against previous close
+        # A single bad field can cause a bogus entry at an impossible price
+        last_close = {}  # symbol -> last valid close
+        bad_tick_count = 0
+        clean_events = []
+        for timestamp, symbol, row in events:
+            close = row["close"]
+            ohlc = [row["open"], row["high"], row["low"], close]
+
+            if symbol in last_close:
+                prev = last_close[symbol]
+                # Check if ANY price field is >15% from previous close
+                is_bad = False
+                for p in ohlc:
+                    if prev > 0 and abs(p - prev) / prev > 0.15:
+                        is_bad = True
+                        break
+                if is_bad:
+                    bad_tick_count += 1
+                    print(f"  ⚠ Bad tick filtered: {symbol} @ {timestamp} "
+                          f"O={row['open']:.2f} H={row['high']:.2f} "
+                          f"L={row['low']:.2f} C={close:.2f} "
+                          f"(prev close={prev:.2f})")
+                    continue  # Skip this bar entirely
+
+            last_close[symbol] = close
+            clean_events.append((timestamp, symbol, row))
+
+        if bad_tick_count > 0:
+            print(f"  ⚠ Filtered {bad_tick_count} bad tick(s) (>20% single-bar move)")
+        events = clean_events
 
         # Process events chronologically
         bar_count = 0
@@ -501,12 +566,13 @@ class BacktestEngine:
             print(f"  Worst Trade:            {worst_pct:>+12.2f}%  (${worst_dollar:>+10,.2f})")
             print(f"  Closed P&L:            ${closed_pnl:>+13,.2f}")
 
-            print(f"\n  {'Symbol':<6} {'Dir':<6} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
-            print(f"  {'-'*72}")
+            print(f"\n  {'Symbol':<6} {'Dir':<6} {'Strat':<14} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
+            print(f"  {'-'*88}")
             for _, t in paired.iterrows():
                 marker = "✓" if t["win"] else "✗"
+                strat = t.get("strategy", "?")[:12]
                 print(
-                    f"  {t['symbol']:<6} {t['direction']:<6} "
+                    f"  {t['symbol']:<6} {t['direction']:<6} {strat:<14} "
                     f"${t['entry_price']:>9,.2f} ${t['exit_price']:>9,.2f} "
                     f"{t['pnl_pct']:>+7.2f}% ${t['net_pnl']:>9,.2f} "
                     f"{t['duration']}  {marker}"
@@ -714,23 +780,40 @@ class BacktestEngine:
                 })
             all_bars[symbol] = bars
 
-        # Build signals from trade log
+        # Build signals from trade log — include stop/target from signal metadata
         signals = []
         trade_log = self._results["trade_log"]
+        # Build order_id lookup from risk manager metadata
+        sig_meta = {}
+        if hasattr(self.risk_manager, 'signal_metadata'):
+            sig_meta = self.risk_manager.signal_metadata
+
         if not trade_log.empty:
             for _, row in trade_log.iterrows():
                 symbol = row["symbol"]
                 ts = pd.Timestamp(row["timestamp"])
                 if symbol in self._bar_data:
                     df = self._bar_data[symbol]
-                    # Handle timezone mismatch: strip tz from both sides
                     df_idx = df.index.tz_localize(None) if df.index.tz else df.index
                     ts_naive = ts.tz_localize(None) if ts.tzinfo else ts
                     idx = df_idx.get_indexer([ts_naive], method="nearest")[0]
                 else:
                     idx = 0
 
-                signals.append({
+                # Find matching metadata by looking for order_id patterns
+                meta = {}
+                order_id = row.get("order_id", "")
+                if order_id and order_id in sig_meta:
+                    meta = sig_meta[order_id]
+                else:
+                    # Fallback: search by strategy + symbol + approximate time
+                    strategy = row.get("strategy", "")
+                    for oid, m in sig_meta.items():
+                        if strategy in oid and symbol in oid:
+                            meta = m
+                            break
+
+                sig_entry = {
                     "index": int(idx),
                     "symbol": symbol,
                     "type": "buy" if row["side"] == "BUY" else "sell",
@@ -738,7 +821,19 @@ class BacktestEngine:
                     "quantity": int(row["quantity"]),
                     "strategy": row.get("strategy", ""),
                     "timestamp": str(row["timestamp"]),
-                })
+                }
+
+                # Add stop/target if available
+                if meta.get("stop"):
+                    sig_entry["stop"] = round(float(meta["stop"]), 4)
+                if meta.get("target"):
+                    sig_entry["target"] = round(float(meta["target"]), 4)
+                if meta.get("exit_reason"):
+                    sig_entry["reason"] = meta["exit_reason"]
+                elif meta.get("bos_type"):
+                    sig_entry["reason"] = meta["bos_type"]
+
+                signals.append(sig_entry)
 
         # Paired trades — include bar indices for visualizer
         paired_list = []
@@ -767,7 +862,18 @@ class BacktestEngine:
                     except Exception:
                         exit_idx = entry_idx + 1
 
-                paired_list.append({
+                # Find stop/target from the entry signal's metadata
+                entry_stop = None
+                entry_target = None
+                # Look through signals for the entry signal at this index
+                for sig in signals:
+                    if (sig.get("index") == entry_idx and sig.get("symbol") == symbol
+                            and sig.get("stop")):
+                        entry_stop = sig.get("stop")
+                        entry_target = sig.get("target")
+                        break
+
+                pt_entry = {
                     "symbol": t["symbol"],
                     "direction": t["direction"],
                     "entry_time": str(t["entry_time"]),
@@ -784,7 +890,13 @@ class BacktestEngine:
                     "duration": str(t["duration"]),
                     "strategy": t.get("strategy", ""),
                     "win": bool(t["win"]),
-                })
+                }
+                if entry_stop is not None:
+                    pt_entry["stop"] = entry_stop
+                if entry_target is not None:
+                    pt_entry["target"] = entry_target
+
+                paired_list.append(pt_entry)
 
         # Equity curve
         history = self._results["portfolio_history"]
