@@ -1,16 +1,19 @@
-"""Moving Average Crossover Strategy — Long AND Short.
+"""Moving Average Crossover Strategy v2 — With Stop/Target.
 
-Always-in-market trend following:
-  Fast MA > Slow MA  →  be LONG
-  Fast MA < Slow MA  →  be SHORT
+v1 Problem: held trades forever waiting for MA re-cross. A $400 winner
+would turn into a -$160 loser because the MAs are slow to react.
 
-Position flips take 2 bars for safety (exit bar + entry bar) because
-the event queue processes signals before fills resolve. Sending EXIT + ENTRY
-on the same bar causes the entry to be sized incorrectly.
+v2 Fix: ATR-based stop loss and take profit on every trade.
+  - Stop: 2 ATR below entry (long) or above entry (short)
+  - Target: 3 ATR in profit direction (1.5:1 risk-reward)
+  - Trailing stop: move stop to breakeven after 1.5 ATR profit
+  - Max hold: 20 bars — if no stop/target hit, exit at market
 
-Volatility regime scales position size:
-  Low vol  → full size (strength=1.0)
-  High vol → half size (strength=0.5)
+This means the strategy still uses MA crossover for DIRECTION, but
+uses ATR for RISK MANAGEMENT. Entry timing from MAs, exit timing from
+price action. This is how professional trend followers work.
+
+Position flips take 2 bars for safety (exit bar + entry bar).
 """
 
 from collections import defaultdict
@@ -32,7 +35,7 @@ def _bars_per_year(interval: str) -> float:
 
 
 class MACrossoverStrategy:
-    """MA Crossover — always-in-market long/short strategy."""
+    """MA Crossover v2 — trend direction + ATR risk management."""
 
     def __init__(self, event_bus: EventBus, params: dict = None):
         default_params = {
@@ -42,6 +45,11 @@ class MACrossoverStrategy:
             "vol_lookback": 30,
             "vol_threshold": 0.25,
             "interval": "15m",
+            "atr_period": 14,
+            "stop_atr_mult": 2.0,
+            "target_atr_mult": 3.0,
+            "trail_trigger_atr": 1.5,
+            "max_hold_bars": 20,
         }
         self.name = "ma_crossover"
         self.event_bus = event_bus
@@ -51,8 +59,12 @@ class MACrossoverStrategy:
         self._price_history: Dict[str, list] = defaultdict(list)
         self._bar_history: Dict[str, list] = defaultdict(list)
 
-        # "long", "short", or None (flat, between exit and next entry)
         self._position: Dict[str, Optional[str]] = {}
+        self._entry_price: Dict[str, float] = {}
+        self._stop_price: Dict[str, float] = {}
+        self._target_price: Dict[str, float] = {}
+        self._original_stop: Dict[str, float] = {}
+        self._bars_in_trade: Dict[str, int] = {}
 
         self._funnel = {
             "bars_processed": 0,
@@ -62,6 +74,11 @@ class MACrossoverStrategy:
             "short_entries": 0,
             "long_exits": 0,
             "short_exits": 0,
+            "exits_stop": 0,
+            "exits_target": 0,
+            "exits_trailing": 0,
+            "exits_timeout": 0,
+            "exits_flip": 0,
             "regime_high": 0,
             "regime_low": 0,
         }
@@ -88,7 +105,6 @@ class MACrossoverStrategy:
             self.event_bus.publish(signal)
 
     def _decide(self, symbol: str) -> Optional[SignalEvent]:
-        """One signal per bar. Exit on flip bar, enter on next bar."""
         self._funnel["bars_processed"] += 1
 
         prices = np.array(self._price_history[symbol])
@@ -99,72 +115,162 @@ class MACrossoverStrategy:
             self._funnel["warmup_skip"] += 1
             return None
 
-        desired = "long" if fast_ma > slow_ma else "short"
+        current_price = prices[-1]
         current = self._position.get(symbol)
+        desired = "long" if fast_ma > slow_ma else "short"
+
+        bars = self._bar_history[symbol]
+        atr_val = self._compute_atr(bars, self.params["atr_period"])
 
         regime = self._get_regime(symbol)
         strength = 1.0 if regime == "low" else 0.5
 
-        meta = {
-            "fast_ma": round(fast_ma, 4),
-            "slow_ma": round(slow_ma, 4),
-            "regime": regime,
-            "desired": desired,
-            "current": current or "flat",
-        }
-
-        # Already correctly positioned
-        if desired == current:
+        # --- Check exits first ---
+        if current is not None:
+            self._bars_in_trade[symbol] = self._bars_in_trade.get(symbol, 0) + 1
+            exit_signal = self._check_exit(symbol, current_price, atr_val, desired)
+            if exit_signal:
+                return exit_signal
             self._funnel["no_change"] += 1
             return None
 
-        # Need to exit first before reversing (flip takes 2 bars)
-        if current == "long" and desired == "short":
-            self._position[symbol] = None
-            self._funnel["long_exits"] += 1
-            return SignalEvent(
-                symbol=symbol, signal_type=SignalType.EXIT_LONG,
-                strength=0.0, strategy_name=self.name,
-                metadata={**meta, "action": "exit_long_for_flip"},
-            )
+        # --- Flat: enter new position ---
+        stop_mult = self.params["stop_atr_mult"]
+        target_mult = self.params["target_atr_mult"]
 
-        if current == "short" and desired == "long":
-            self._position[symbol] = None
-            self._funnel["short_exits"] += 1
-            return SignalEvent(
-                symbol=symbol, signal_type=SignalType.EXIT_SHORT,
-                strength=0.0, strategy_name=self.name,
-                metadata={**meta, "action": "exit_short_for_flip"},
-            )
-
-        # Flat → enter new position
-        if current is None and desired == "long":
+        if desired == "long":
+            stop = current_price - stop_mult * atr_val
+            target = current_price + target_mult * atr_val
             self._position[symbol] = "long"
+            self._entry_price[symbol] = current_price
+            self._stop_price[symbol] = stop
+            self._original_stop[symbol] = stop
+            self._target_price[symbol] = target
+            self._bars_in_trade[symbol] = 0
             self._funnel["long_entries"] += 1
+
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.LONG,
                 strength=strength, strategy_name=self.name,
-                metadata={**meta, "action": "enter_long"},
+                metadata={
+                    "fast_ma": round(fast_ma, 4), "slow_ma": round(slow_ma, 4),
+                    "regime": regime, "action": "enter_long",
+                    "stop": round(stop, 4), "target": round(target, 4),
+                    "entry": round(current_price, 4),
+                },
             )
 
-        if current is None and desired == "short":
+        elif desired == "short":
+            stop = current_price + stop_mult * atr_val
+            target = current_price - target_mult * atr_val
             self._position[symbol] = "short"
+            self._entry_price[symbol] = current_price
+            self._stop_price[symbol] = stop
+            self._original_stop[symbol] = stop
+            self._target_price[symbol] = target
+            self._bars_in_trade[symbol] = 0
             self._funnel["short_entries"] += 1
+
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.SHORT,
                 strength=strength, strategy_name=self.name,
-                metadata={**meta, "action": "enter_short"},
+                metadata={
+                    "fast_ma": round(fast_ma, 4), "slow_ma": round(slow_ma, 4),
+                    "regime": regime, "action": "enter_short",
+                    "stop": round(stop, 4), "target": round(target, 4),
+                    "entry": round(current_price, 4),
+                },
             )
 
         self._funnel["no_change"] += 1
         return None
 
-    def _ma(self, prices: np.ndarray, period: int) -> Optional[float]:
+    def _check_exit(self, symbol, price, atr_val, desired):
+        direction = self._position[symbol]
+        stop = self._stop_price[symbol]
+        target = self._target_price[symbol]
+        entry = self._entry_price[symbol]
+        bars_held = self._bars_in_trade.get(symbol, 0)
+
+        # Trailing stop
+        trigger = self.params["trail_trigger_atr"] * atr_val
+        if direction == "long" and price > entry + trigger:
+            new_stop = max(stop, entry + atr_val * 0.1)
+            if new_stop > self._original_stop.get(symbol, stop):
+                self._stop_price[symbol] = new_stop
+                stop = new_stop
+        elif direction == "short" and price < entry - trigger:
+            new_stop = min(stop, entry - atr_val * 0.1)
+            if new_stop < self._original_stop.get(symbol, stop):
+                self._stop_price[symbol] = new_stop
+                stop = new_stop
+
+        should_exit = False
+        exit_reason = ""
+
+        if direction == "long":
+            if price <= stop:
+                should_exit = True
+                exit_reason = "trailing" if stop > self._original_stop.get(symbol, stop) else "stop"
+            elif price >= target:
+                should_exit, exit_reason = True, "target"
+        elif direction == "short":
+            if price >= stop:
+                should_exit = True
+                exit_reason = "trailing" if stop < self._original_stop.get(symbol, stop) else "stop"
+            elif price <= target:
+                should_exit, exit_reason = True, "target"
+
+        if not should_exit and bars_held >= self.params["max_hold_bars"]:
+            should_exit, exit_reason = True, "timeout"
+
+        if not should_exit and direction != desired:
+            should_exit, exit_reason = True, "flip"
+
+        if should_exit:
+            exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
+
+            if exit_reason == "stop": self._funnel["exits_stop"] += 1
+            elif exit_reason == "target": self._funnel["exits_target"] += 1
+            elif exit_reason == "trailing": self._funnel["exits_trailing"] += 1
+            elif exit_reason == "timeout": self._funnel["exits_timeout"] += 1
+            elif exit_reason == "flip": self._funnel["exits_flip"] += 1
+
+            if direction == "long": self._funnel["long_exits"] += 1
+            else: self._funnel["short_exits"] += 1
+
+            self._position[symbol] = None
+            self._entry_price.pop(symbol, None)
+            self._stop_price.pop(symbol, None)
+            self._original_stop.pop(symbol, None)
+            self._target_price.pop(symbol, None)
+            self._bars_in_trade.pop(symbol, None)
+
+            return SignalEvent(
+                symbol=symbol, signal_type=exit_type,
+                strength=0.0, strategy_name=self.name,
+                metadata={"exit_reason": exit_reason, "exit_price": round(price, 4),
+                          "entry_price": round(entry, 4)},
+            )
+        return None
+
+    def _compute_atr(self, bars, period):
+        if len(bars) < period + 1:
+            return 1.0
+        trs = []
+        for i in range(-period, 0):
+            b = bars[i]
+            prev_c = bars[i-1]["close"]
+            tr = max(b["high"] - b["low"], abs(b["high"] - prev_c), abs(b["low"] - prev_c))
+            trs.append(tr)
+        return sum(trs) / len(trs)
+
+    def _ma(self, prices, period):
         if len(prices) < period:
             return None
         return float(prices[-period:].mean())
 
-    def _get_regime(self, symbol: str) -> str:
+    def _get_regime(self, symbol):
         prices = np.array(self._price_history.get(symbol, []))
         lb = self.params["vol_lookback"]
         if len(prices) < lb + 1:
@@ -176,13 +282,13 @@ class MACrossoverStrategy:
         self._funnel[f"regime_{regime}"] += 1
         return regime
 
-    def get_prices(self, symbol: str) -> np.ndarray:
+    def get_prices(self, symbol):
         return np.array(self._price_history.get(symbol, []))
 
-    def calculate_signal(self, symbol: str) -> Optional[SignalEvent]:
+    def calculate_signal(self, symbol):
         return None
 
-    def get_diagnostics(self) -> Dict:
+    def get_diagnostics(self):
         diag = {}
         for sym in self.params.get("symbols", []):
             prices = self.get_prices(sym)
@@ -207,10 +313,15 @@ class MACrossoverStrategy:
         print(f"    ├─ Already positioned:  {f['no_change']:>8,}")
         print(f"    ├─ Enter LONG:          {f['long_entries']:>8,}")
         print(f"    ├─ Enter SHORT:         {f['short_entries']:>8,}")
-        print(f"    ├─ Exit long (flip):    {f['long_exits']:>8,}")
-        print(f"    └─ Exit short (flip):   {f['short_exits']:>8,}")
+        print(f"    ├─ Exit long:           {f['long_exits']:>8,}")
+        print(f"    └─ Exit short:          {f['short_exits']:>8,}")
         print(f"  {'─'*50}")
         print(f"  Total signals:            {total_signals:>8,}  ({total_entries} entries + {total_exits} exits)")
+        print(f"  Exits — stop:             {f['exits_stop']:>8,}")
+        print(f"  Exits — target:           {f['exits_target']:>8,}")
+        print(f"  Exits — trailing:         {f['exits_trailing']:>8,}")
+        print(f"  Exits — timeout:          {f['exits_timeout']:>8,}  (>{self.params['max_hold_bars']} bars)")
+        print(f"  Exits — MA flip:          {f['exits_flip']:>8,}")
         print(f"  Vol regime — low:         {f['regime_low']:>8,}")
         print(f"  Vol regime — high:        {f['regime_high']:>8,}")
         print(f"  {'─'*50}")
