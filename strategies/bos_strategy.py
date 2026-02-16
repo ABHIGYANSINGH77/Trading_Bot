@@ -1,6 +1,6 @@
 """Break of Structure (BOS) Strategy v2 — With Regime Detection.
 
-Improvements over initial bos strategy:
+Improvements over v1:
   1. REGIME FILTER: Only trades when ADX-style trend strength is sufficient.
      Sits in cash during ranging/choppy markets (where v1 lost all its money).
 
@@ -156,6 +156,8 @@ class BOSStrategy(BaseStrategy):
             # --- New: trailing stop ---
             "use_trailing_stop": True,
             "trail_trigger_atr": 1.0,     # Move stop to BE after 1 ATR profit
+            # --- New: max hold timeout ---
+            "max_hold_bars": 30,          # Exit if no stop/target in 30 bars
         }
         merged = {**default_params, **(params or {})}
         super().__init__("bos", event_bus, merged)
@@ -168,6 +170,7 @@ class BOSStrategy(BaseStrategy):
         self._stop_price: Dict[str, float] = {}
         self._target_price: Dict[str, float] = {}
         self._original_stop: Dict[str, float] = {}  # For trailing stop
+        self._bars_in_trade: Dict[str, int] = {}    # For timeout
         self._trade_count: Dict[str, int] = defaultdict(int)
 
         # Signal funnel
@@ -188,6 +191,7 @@ class BOSStrategy(BaseStrategy):
             "exits_trailing": 0,       # NEW
             "exits_target": 0,
             "exits_reversal": 0,
+            "exits_timeout": 0,
             "signals_sent": 0,
         }
 
@@ -215,7 +219,8 @@ class BOSStrategy(BaseStrategy):
         atr_values = atr(high, low, close, self.params["atr_period"])
         rsi_values = rsi(close, 14)
         rvol_values = relative_volume(volume, 20)
-        vwap_values = vwap(high, low, close, volume)
+        timestamps = np.array([b["timestamp"] for b in bars])
+        vwap_values = vwap(high, low, close, volume, timestamps)
         adx_values = _adx(high, low, close, self.params["adx_period"])
 
         current_atr = atr_values[-1] if not np.isnan(atr_values[-1]) else 0
@@ -365,6 +370,7 @@ class BOSStrategy(BaseStrategy):
         self._stop_price[symbol] = pending["stop"]
         self._original_stop[symbol] = pending["stop"]
         self._target_price[symbol] = pending["target"]
+        self._bars_in_trade[symbol] = 0
         self._trade_count[symbol] += 1
         self._funnel["pullback_entered"] += 1
         self._funnel["signals_sent"] += 1
@@ -391,11 +397,14 @@ class BOSStrategy(BaseStrategy):
     def _check_exit(
         self, symbol: str, price: float, current_atr: float, structure: Dict,
     ) -> Optional[SignalEvent]:
-        """Check stop loss, trailing stop, take profit, and structure exits."""
+        """Check stop loss, trailing stop, take profit, timeout, and structure exits."""
         direction = self._in_position[symbol]
         stop = self._stop_price[symbol]
         target = self._target_price[symbol]
         entry = self._entry_price.get(symbol, price)
+
+        # Track bars in trade
+        self._bars_in_trade[symbol] = self._bars_in_trade.get(symbol, 0) + 1
 
         # --- Trailing stop: move to breakeven after 1 ATR profit ---
         if self.params["use_trailing_stop"]:
@@ -417,7 +426,6 @@ class BOSStrategy(BaseStrategy):
         if direction == "long":
             if price <= stop:
                 should_exit = True
-                # Determine if this was the original stop or trailing
                 exit_reason = "trailing_stop" if stop > self._original_stop.get(symbol, stop) else "stop_loss"
             elif price >= target:
                 should_exit = True
@@ -441,6 +449,11 @@ class BOSStrategy(BaseStrategy):
                 should_exit = True
                 exit_reason = "structure_reversal"
 
+        # Timeout: max hold
+        if not should_exit and self._bars_in_trade.get(symbol, 0) >= self.params["max_hold_bars"]:
+            should_exit = True
+            exit_reason = "timeout"
+
         if should_exit:
             exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
             pnl_pct = (price - entry) / entry if direction == "long" else (entry - price) / entry
@@ -453,6 +466,8 @@ class BOSStrategy(BaseStrategy):
                 self._funnel["exits_target"] += 1
             elif exit_reason == "structure_reversal":
                 self._funnel["exits_reversal"] += 1
+            elif exit_reason == "timeout":
+                self._funnel["exits_timeout"] += 1
             self._funnel["signals_sent"] += 1
 
             # Clean up
@@ -461,6 +476,7 @@ class BOSStrategy(BaseStrategy):
             self._stop_price.pop(symbol, None)
             self._original_stop.pop(symbol, None)
             self._target_price.pop(symbol, None)
+            self._bars_in_trade.pop(symbol, None)
 
             return SignalEvent(
                 symbol=symbol,
@@ -522,4 +538,5 @@ class BOSStrategy(BaseStrategy):
         print(f"  Exits — trailing stop:    {f['exits_trailing']:>8,}")
         print(f"  Exits — take profit:      {f['exits_target']:>8,}")
         print(f"  Exits — reversal:         {f['exits_reversal']:>8,}")
+        print(f"  Exits — timeout:          {f['exits_timeout']:>8,}  (>{self.params['max_hold_bars']} bars)")
         print(f"  {'─'*50}")
