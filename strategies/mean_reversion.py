@@ -101,9 +101,9 @@ class MeanReversionStrategy(BaseStrategy):
             "bb_period": 20,
             "bb_std": 2.0,
             "rsi_period": 14,
-            "rsi_oversold": 30,
-            "rsi_overbought": 70,
-            "adx_max": 25,
+            "rsi_oversold": 35,       # Was 30 — too strict, missed entries
+            "rsi_overbought": 65,     # Was 70 — too strict
+            "adx_max": 30,            # Was 25 — filtered 48% of bars
             "atr_stop_mult": 2.0,
             "max_hold_bars": 40,
             "min_bars": 50,
@@ -169,8 +169,12 @@ class MeanReversionStrategy(BaseStrategy):
             return None
 
         # --- Entry signals ---
-        # Long: price at lower band + RSI oversold
-        if price <= lower_band and rsi_val < self.params["rsi_oversold"]:
+        # Use proximity to band (within 10% of band distance) instead of exact touch
+        band_width = upper_band - lower_band
+        band_tolerance = band_width * 0.10  # Within 10% of the band
+
+        # Long: price near lower band + RSI oversold
+        if price <= lower_band + band_tolerance and rsi_val < self.params["rsi_oversold"]:
             stop = price - self.params["atr_stop_mult"] * atr_val
             self._in_position[symbol] = "long"
             self._entry_price[symbol] = price
@@ -185,8 +189,8 @@ class MeanReversionStrategy(BaseStrategy):
                           "rsi": rsi_val, "adx": adx_val, "band": "lower"},
             )
 
-        # Short: price at upper band + RSI overbought
-        if price >= upper_band and rsi_val > self.params["rsi_overbought"]:
+        # Short: price near upper band + RSI overbought
+        if price >= upper_band - band_tolerance and rsi_val > self.params["rsi_overbought"]:
             stop = price + self.params["atr_stop_mult"] * atr_val
             self._in_position[symbol] = "short"
             self._entry_price[symbol] = price
