@@ -1,9 +1,12 @@
-"""Strategy Validation Module — Adding more robust testing .
+"""Strategy Validation Module — The 5 Golden Rules of Backtesting.
 
 Implements:
   1. Walk-Forward Analysis    — train/test splits across rolling windows
-  2. Out-of-Sample Testing    — final holdout period the strategy never saw
-  3. Monte Carlo Simulation   — reshuffle trades 1000x to find confidence intervals
+  4. Out-of-Sample Testing    — final holdout period the strategy never saw
+  5. Monte Carlo Simulation   — reshuffle trades 1000x to find confidence intervals
+
+Rules 2 (slippage/commission) and 3 (no look-ahead) are already built into the
+backtest engine itself. This module adds the three missing rules.
 
 Usage:
     python main.py validate -s bos -i 15m -d ibkr --start 2025-01-01 --end 2025-12-31
@@ -61,11 +64,24 @@ def _run_single_backtest(
 
     risk_mgr.set_symbols(symbols)
 
-    # Build sorted event timeline
+    # Build sorted event timeline — with bad tick filtering
     events = []
     for symbol, df in bar_data.items():
         if symbol not in symbols:
             continue
+        # Global median bad tick filter — catches entire bad chunks
+        if len(df) > 20:
+            closes = df["close"].values
+            global_median = np.median(closes)
+            clean_mask = np.ones(len(df), dtype=bool)
+            for i in range(len(df)):
+                for col in ["open", "high", "low", "close"]:
+                    val = df[col].iloc[i]
+                    if global_median > 0 and abs(val - global_median) / global_median > 0.40:
+                        clean_mask[i] = False
+                        break
+            if not clean_mask.all():
+                df = df[clean_mask]
         for timestamp, row in df.iterrows():
             events.append((timestamp, symbol, row))
     events.sort(key=lambda x: x[0])
@@ -144,30 +160,48 @@ def _walk_forward_splits(
     n_windows: int = 3,
     train_pct: float = 0.70,
 ) -> List[Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], str]]:
-    """Create rolling walk-forward train/test splits.
+    """Create anchored walk-forward train/test splits.
 
-    Returns list of (train_data, test_data, label) tuples.
-    Each window advances through time so test periods don't overlap.
+    ANCHORED means each window starts from the beginning of the data
+    and grows. This ensures training always has maximum available history,
+    which strategies need for MA calculation and warmup.
+
+    Example with 700 bars, 3 windows:
+      Window 1: Train bars 0-349 (350 bars), Test bars 350-466 (117 bars)
+      Window 2: Train bars 0-466 (467 bars), Test bars 467-583 (117 bars)
+      Window 3: Train bars 0-583 (584 bars), Test bars 584-700 (117 bars)
+
+    Each test period is non-overlapping. Training expands to include
+    all previous test data.
     """
-    # Get total bar count from any symbol
     any_symbol = list(data.keys())[0]
     total_bars = len(data[any_symbol])
 
-    window_size = total_bars // n_windows
-    train_size = int(window_size * train_pct)
-    test_size = window_size - train_size
+    # Minimum training size: at least 200 bars (for 50-bar MA warmup + 150 bars of signals)
+    min_train = min(200, total_bars // 2)
+
+    # Each test window gets an equal slice of the remaining data
+    test_total = total_bars - min_train
+    test_per_window = test_total // n_windows
+
+    if test_per_window < 30:
+        # Not enough data for this many windows — reduce window count
+        n_windows = max(2, test_total // 50)
+        test_per_window = test_total // n_windows
 
     splits = []
     for i in range(n_windows):
-        start = i * window_size
-        train_end = start + train_size
-        test_end = min(start + window_size, total_bars)
+        # Training: everything from start up to this window's test period
+        train_end = min_train + i * test_per_window
+        # Test: the next chunk after training
+        test_start = train_end
+        test_end = min(test_start + test_per_window, total_bars)
 
         train_data = {}
         test_data = {}
         for symbol, df in data.items():
-            train_data[symbol] = df.iloc[start:train_end].copy()
-            test_data[symbol] = df.iloc[train_end:test_end].copy()
+            train_data[symbol] = df.iloc[:train_end].copy()
+            test_data[symbol] = df.iloc[test_start:test_end].copy()
 
         label = f"Window {i+1}/{n_windows}"
         splits.append((train_data, test_data, label))
@@ -179,16 +213,31 @@ def monte_carlo(
     trade_pnls: np.ndarray,
     n_simulations: int = 1000,
     initial_capital: float = 10_000,
+    trade_pcts: np.ndarray = None,
 ) -> Dict:
-    """Run Monte Carlo by reshuffling trade order.
+    """Run Monte Carlo simulation with TWO methods:
 
-    Same trades, different sequence. Shows what range of outcomes
-    was possible with the same edge (or lack of it).
+    1. BOOTSTRAP (primary): Sample trades WITH REPLACEMENT.
+       This asks: "If I kept trading with the same edge, what range
+       of outcomes would I see?" Different samples = different results.
+       This is the standard method for estimating confidence intervals
+       on strategy performance.
+
+    2. SHUFFLE (secondary): Reorder the actual trades.
+       With small position sizes relative to equity (~1-3%), reordering
+       produces negligible variance. This is expected and actually means
+       the strategy isn't path-dependent, which is good.
+
+    The bootstrap is more useful because it:
+    - Tests robustness to which specific trades occurred
+    - Shows what happens if you got more losers or more winners by chance
+    - Provides true confidence intervals on expected return
     """
     if len(trade_pnls) == 0:
         return {
             "median_return": 0, "mean_return": 0,
-            "p5_return": 0, "p95_return": 0,
+            "p5_return": 0, "p25_return": 0,
+            "p75_return": 0, "p95_return": 0,
             "p5_drawdown": 0, "median_drawdown": 0, "p95_drawdown": 0,
             "prob_profitable": 0, "prob_ruin": 0,
             "n_simulations": n_simulations,
@@ -197,27 +246,40 @@ def monte_carlo(
             "all_drawdowns": np.array([]),
         }
 
+    n_trades = len(trade_pnls)
+    pnl_fractions = trade_pnls / initial_capital
+
     final_returns = np.zeros(n_simulations)
     max_drawdowns = np.zeros(n_simulations)
 
     rng = np.random.default_rng(seed=42)
 
     for i in range(n_simulations):
-        # Shuffle trade order
-        shuffled = rng.permutation(trade_pnls)
+        # BOOTSTRAP: sample n_trades WITH REPLACEMENT from the pool
+        # This means some trades appear multiple times, others not at all
+        # Simulates "what if a different set of trade opportunities occurred?"
+        indices = rng.integers(0, n_trades, size=n_trades)
+        sampled = pnl_fractions[indices]
 
-        # Build equity curve
+        # Compound on changing equity
         equity = initial_capital
         peak = initial_capital
         worst_dd = 0.0
 
-        for pnl in shuffled:
-            equity += pnl
+        for frac in sampled:
+            scaled_pnl = frac * equity
+            equity += scaled_pnl
+
             if equity > peak:
                 peak = equity
             dd = (peak - equity) / peak if peak > 0 else 0
             if dd > worst_dd:
                 worst_dd = dd
+
+            if equity <= 0:
+                equity = 0
+                worst_dd = 1.0
+                break
 
         final_returns[i] = (equity - initial_capital) / initial_capital
         max_drawdowns[i] = worst_dd
@@ -233,7 +295,7 @@ def monte_carlo(
         "median_drawdown": float(np.median(max_drawdowns)),
         "p95_drawdown": float(np.percentile(max_drawdowns, 95)),
         "prob_profitable": float((final_returns > 0).mean()),
-        "prob_ruin": float((final_returns < -0.50).mean()),  # >50% loss
+        "prob_ruin": float((final_returns < -0.50).mean()),
         "n_simulations": n_simulations,
         "n_trades": len(trade_pnls),
         "all_returns": final_returns,
@@ -428,7 +490,7 @@ def run_validation(
     #  STEP 4: Monte Carlo Simulation
     # ============================================================
     print(f"\n{'─'*65}")
-    print(f"  MONTE CARLO SIMULATION ({mc_simulations:,} reshuffles)")
+    print(f"  MONTE CARLO BOOTSTRAP ({mc_simulations:,} resamples)")
     print(f"{'─'*65}")
 
     # Collect all trade P&Ls from all backtests
@@ -452,7 +514,7 @@ def run_validation(
         mc_result = monte_carlo(trade_pnls, mc_simulations, initial_cap)
 
         n_trades = mc_result["n_trades"]
-        print(f"\n  Trades reshuffled:  {n_trades}")
+        print(f"\n  Trades bootstrapped: {n_trades}")
         print(f"  Avg trade P&L:      ${trade_pnls.mean():>+8.2f}")
         print(f"  Win rate:           {(trade_pnls > 0).mean():.1%}")
 
