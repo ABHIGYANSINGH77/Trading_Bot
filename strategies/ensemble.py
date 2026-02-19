@@ -80,10 +80,14 @@ def _adx(high, low, close, period=14):
 def _higher_tf_trend(bars: list, multiplier: int = 4) -> str:
     """Build higher-timeframe bars and determine trend direction.
 
-    For 15m bars with multiplier=4, this creates 1h bars.
+    For 1h bars with multiplier=4, this creates ~4h bars.
+    Uses multiple timeframes for confirmation:
+      - Short-term: 10-bar vs 20-bar MA (recent direction)
+      - Medium-term: 20-bar vs 50-bar MA (established trend)
+    Both must agree for a confident trend call.
     Returns "bullish", "bearish", or "neutral".
     """
-    if len(bars) < multiplier * 10:
+    if len(bars) < multiplier * 50:
         return "neutral"
 
     # Aggregate bars into higher timeframe
@@ -92,18 +96,37 @@ def _higher_tf_trend(bars: list, multiplier: int = 4) -> str:
         chunk = bars[i:i+multiplier]
         htf_close.append(chunk[-1]["close"])
 
-    if len(htf_close) < 20:
+    if len(htf_close) < 50:
         return "neutral"
 
     htf = np.array(htf_close)
 
-    # Simple trend: is 10-period MA above or below 20-period MA?
-    fast = htf[-10:].mean()
-    slow = htf[-20:].mean()
+    # Short-term trend
+    fast_s = htf[-10:].mean()
+    slow_s = htf[-20:].mean()
 
-    if fast > slow * 1.002:
+    # Medium-term trend (the macro trend)
+    fast_m = htf[-20:].mean()
+    slow_m = htf[-50:].mean()
+
+    # Also check: is current price above or below the 50-period MA?
+    price_vs_50 = htf[-1] / slow_m - 1.0
+
+    short_bull = fast_s > slow_s * 1.001
+    short_bear = fast_s < slow_s * 0.999
+    medium_bull = fast_m > slow_m * 1.002
+    medium_bear = fast_m < slow_m * 0.998
+
+    # Strong bullish: both timeframes agree + price above 50 MA
+    if medium_bull and (short_bull or price_vs_50 > 0.02):
         return "bullish"
-    elif fast < slow * 0.998:
+    # Strong bearish: both agree + price below 50 MA
+    elif medium_bear and (short_bear or price_vs_50 < -0.02):
+        return "bearish"
+    # Weak trend: only short-term signal
+    elif short_bull and price_vs_50 > 0:
+        return "bullish"
+    elif short_bear and price_vs_50 < 0:
         return "bearish"
     return "neutral"
 
@@ -118,27 +141,26 @@ class StrategyAllocator:
     CRISIS = "crisis"
 
     # Allocation weights per regime: {strategy_name: weight}
-    # IMPORTANT: On small accounts ($10k), weights below 0.15 cause position
-    # sizes to fall below min_order_value and get dropped. The minimum
-    # weight for a strategy that should still trade is 0.15 (15%).
-    # Strategies that should NOT trade in a regime get 0.0.
+    # With trend direction filter, BOS and MA only trade WITH the trend.
+    # Weights below 0.15 on $10k accounts cause min_order drops.
+    # Strategies get 0% in wrong-regime to avoid micro-positions.
     ALLOCATIONS = {
         "trending": {
-            "bos": 0.45,
-            "ma_crossover": 0.35,
-            "mean_reversion": 0.0,       # Don't trade mean reversion in trends
-            "vol_breakout": 0.20,
+            "bos": 0.35,
+            "ma_crossover": 0.20,       # Reduced from 35% — still trades but less dominant
+            "mean_reversion": 0.0,       # Don't mean-revert in trends
+            "vol_breakout": 0.30,        # Increased — best performer
         },
         "ranging": {
-            "bos": 0.0,                  # Don't trade breakouts in ranges
-            "ma_crossover": 0.0,         # Don't trade trend-following in ranges
-            "mean_reversion": 0.65,
-            "vol_breakout": 0.35,
+            "bos": 0.0,
+            "ma_crossover": 0.0,
+            "mean_reversion": 0.50,      # Reduced from 65% — leave room
+            "vol_breakout": 0.50,        # Increased from 35%
         },
         "volatile": {
             "bos": 0.15,
             "ma_crossover": 0.0,
-            "mean_reversion": 0.20,
+            "mean_reversion": 0.25,      # Increased from 20%
             "vol_breakout": 0.45,
             "_size_scale": 0.6,
         },
@@ -181,9 +203,14 @@ class StrategyAllocator:
         # Crisis: vol expanding rapidly beyond normal
         if vol_ratio > self.vol_crisis_mult:
             regime = self.CRISIS
-        # Volatile: significant vol expansion
-        elif vol_ratio > 1.8:
-            regime = self.VOLATILE
+        # Volatile: significant vol expansion (was 1.8, too high — NVDA regularly hits 1.4)
+        elif vol_ratio > 1.4:
+            # Can be volatile AND trending — check ADX too
+            if current_adx > self.adx_trending:
+                # High trend + high vol: reduce sizing, keep trend strategies
+                regime = self.VOLATILE  # Will use volatile weights with _size_scale=0.6
+            else:
+                regime = self.VOLATILE
         # Trending: strong directional movement
         elif current_adx > self.adx_trending:
             regime = self.TRENDING
@@ -295,9 +322,28 @@ class EnsembleStrategy(BaseStrategy):
         self._signals_by_regime = defaultdict(lambda: defaultdict(int))
         self._signals_scaled = 0
         self._signals_blocked = 0
+        self._signals_trend_blocked = 0
+        self._htf_trend_per_symbol: Dict[str, str] = {}
+
+        # --- CONFLUENCE FILTER STATE ---
+        # VWAP: session-based, resets daily (institutional benchmark)
+        self._current_vwap: Dict[str, float] = {}
+        self._vwap_session_date: Dict[str, object] = {}
+        self._vwap_cum_tp_vol: Dict[str, float] = {}
+        self._vwap_cum_vol: Dict[str, float] = {}
+        # Volume: 20-bar rolling average for confirmation
+        self._volume_history: Dict[str, list] = defaultdict(list)
+        self._avg_volume: Dict[str, float] = {}
+        # Time tracking for time-of-day filter
+        self._current_bar_time: Dict[str, object] = {}
+        # Confluence diagnostics
+        self._confluence_vwap_blocked = 0
+        self._confluence_volume_blocked = 0
+        self._confluence_lunch_blocked = 0
+        self._confluence_passed = 0
 
     def _on_market_data_ensemble(self, event: MarketDataEvent):
-        """Track bars for regime detection."""
+        """Track bars for regime detection, trend direction, and confluence filters."""
         if not self._is_active:
             return
         symbol = event.symbol
@@ -309,14 +355,48 @@ class EnsembleStrategy(BaseStrategy):
             "volume": event.volume,
         })
 
-        # Detect regime
+        # --- CONFLUENCE: Compute session VWAP per symbol ---
+        # Reset at start of each trading day (session-based, like institutions)
         bars = self._bar_history[symbol]
+        ts = event.bar_timestamp or event.timestamp
+        bar_date = getattr(ts, 'date', lambda: None)()
+
+        if bar_date and bar_date != self._vwap_session_date.get(symbol):
+            # New trading day — reset VWAP accumulators
+            self._vwap_session_date[symbol] = bar_date
+            self._vwap_cum_tp_vol[symbol] = 0.0
+            self._vwap_cum_vol[symbol] = 0.0
+
+        tp = (event.high + event.low + event.close) / 3.0
+        self._vwap_cum_tp_vol[symbol] = self._vwap_cum_tp_vol.get(symbol, 0.0) + tp * event.volume
+        self._vwap_cum_vol[symbol] = self._vwap_cum_vol.get(symbol, 0.0) + event.volume
+
+        if self._vwap_cum_vol[symbol] > 0:
+            self._current_vwap[symbol] = self._vwap_cum_tp_vol[symbol] / self._vwap_cum_vol[symbol]
+        else:
+            self._current_vwap[symbol] = event.close
+
+        # --- CONFLUENCE: Track rolling volume average (20-bar) ---
+        vol_history = self._volume_history[symbol]
+        vol_history.append(event.volume)
+        if len(vol_history) > 20:
+            vol_history.pop(0)
+        self._avg_volume[symbol] = sum(vol_history) / len(vol_history) if vol_history else 1.0
+
+        # Store current bar time for time-of-day filter
+        self._current_bar_time[symbol] = ts
+
+        # Detect regime
         if len(bars) >= 60:
             high = np.array([b["high"] for b in bars])
             low = np.array([b["low"] for b in bars])
             close = np.array([b["close"] for b in bars])
             regime = self.allocator.detect_regime(high, low, close)
             self._regime_counts[regime] += 1
+
+        # Track HTF trend direction per symbol
+        htf_trend = _higher_tf_trend(bars, multiplier=4)
+        self._htf_trend_per_symbol[symbol] = htf_trend
 
     def _intercept_publish(self, event):
         """Intercept signal events and scale them based on regime."""
@@ -338,23 +418,97 @@ class EnsembleStrategy(BaseStrategy):
             self._signals_scaled += 1
             self._signals_by_regime[regime][event.strategy_name] += 1
 
-            # Add higher-timeframe context to metadata
+            # --- TREND DIRECTION FILTER ---
+            # For trend-following strategies (BOS, MA Crossover):
+            # HARD BLOCK signals that go against the macro trend
+            # Mean Reversion and Vol Breakout are exempt (they can counter-trend)
             symbol = event.symbol
             bars = self._bar_history.get(symbol, [])
-            htf_trend = _higher_tf_trend(bars, multiplier=4)
+            htf_trend = self._htf_trend_per_symbol.get(symbol, "neutral")
             event.metadata["htf_trend"] = htf_trend
 
-            # Additional filter: if signal direction conflicts with HTF trend, reduce strength
-            if htf_trend != "neutral":
-                is_long = event.signal_type in (SignalType.LONG,)
-                is_short = event.signal_type in (SignalType.SHORT,)
+            is_long = event.signal_type in (SignalType.LONG,)
+            is_short = event.signal_type in (SignalType.SHORT,)
+            is_trend_strategy = event.strategy_name in ("bos", "ma_crossover")
 
+            if is_trend_strategy and htf_trend != "neutral":
+                # BLOCK counter-trend entries entirely
                 if (is_long and htf_trend == "bearish") or (is_short and htf_trend == "bullish"):
-                    event.strength *= 0.3  # Heavily reduce counter-trend signals
-                    event.metadata["htf_conflict"] = True
-                elif (is_long and htf_trend == "bullish") or (is_short and htf_trend == "bearish"):
-                    event.strength = min(event.strength * 1.3, 1.0)  # Boost aligned signals
+                    self._signals_trend_blocked += 1
+                    return  # Don't publish — this is the key fix
+
+                # BOOST trend-aligned signals
+                if (is_long and htf_trend == "bullish") or (is_short and htf_trend == "bearish"):
+                    event.strength = min(event.strength * 1.3, 1.0)
                     event.metadata["htf_aligned"] = True
+
+            # For non-trend strategies, reduce counter-trend but don't block
+            elif not is_trend_strategy and htf_trend != "neutral":
+                if (is_long and htf_trend == "bearish") or (is_short and htf_trend == "bullish"):
+                    event.strength *= 0.5
+                    event.metadata["htf_conflict"] = True
+
+            # ═══════════════════════════════════════════════════════════
+            #  CONFLUENCE FILTERS — Applied to ALL entry signals
+            #  These are what prop firms use to filter out low-quality entries.
+            #  Exits are ALWAYS allowed through (never block closing a position).
+            # ═══════════════════════════════════════════════════════════
+            is_entry = event.signal_type in (SignalType.LONG, SignalType.SHORT)
+
+            if is_entry:
+                # --- 1. VWAP DIRECTIONAL GATE ---
+                # The #1 institutional intraday filter:
+                #   LONG only if price > VWAP (buyers in control)
+                #   SHORT only if price < VWAP (sellers in control)
+                # This alone filters ~30% of bad signals.
+                current_vwap = self._current_vwap.get(symbol, 0)
+                if current_vwap > 0:
+                    current_price = self._bar_history[symbol][-1]["close"] if self._bar_history[symbol] else 0
+                    if current_price > 0:
+                        # Allow a small tolerance (0.1% of VWAP) to avoid
+                        # blocking signals right at the VWAP line
+                        vwap_tolerance = current_vwap * 0.001
+
+                        if is_long and current_price < (current_vwap - vwap_tolerance):
+                            self._confluence_vwap_blocked += 1
+                            event.metadata["blocked_reason"] = "vwap_gate"
+                            return  # BLOCKED: trying to go long below VWAP
+
+                        if is_short and current_price > (current_vwap + vwap_tolerance):
+                            self._confluence_vwap_blocked += 1
+                            event.metadata["blocked_reason"] = "vwap_gate"
+                            return  # BLOCKED: trying to go short above VWAP
+
+                # --- 2. VOLUME CONFIRMATION ---
+                # Only enter when current bar volume > 1.2x 20-bar average.
+                # Low volume = thin market, signals are noise.
+                # Prop firms never trade in thin conditions.
+                if self._bar_history[symbol]:
+                    current_vol = self._bar_history[symbol][-1]["volume"]
+                    avg_vol = self._avg_volume.get(symbol, 0)
+                    vol_threshold = 1.2  # 20% above average
+
+                    if avg_vol > 0 and current_vol < avg_vol * vol_threshold:
+                        self._confluence_volume_blocked += 1
+                        event.metadata["blocked_reason"] = "low_volume"
+                        return  # BLOCKED: insufficient volume conviction
+
+                # --- 3. TIME-OF-DAY FILTER ---
+                # Avoid entries during lunch lull (12:00-13:00 ET).
+                # Low participation = unreliable signals.
+                # Best entries: 09:30-11:30 (open drive) and 14:00-15:15 (close drive)
+                bar_time = self._current_bar_time.get(symbol)
+                if bar_time is not None:
+                    bar_hour = getattr(bar_time, 'hour', None)
+                    if bar_hour is not None and bar_hour == 12:
+                        self._confluence_lunch_blocked += 1
+                        event.metadata["blocked_reason"] = "lunch_lull"
+                        return  # BLOCKED: lunch hour — low volume, choppy
+
+                # All confluence checks passed
+                self._confluence_passed += 1
+                event.metadata["confluence_ok"] = True
+                event.metadata["vwap"] = round(self._current_vwap.get(symbol, 0), 2)
 
         # Publish via original method
         self._original_publish(event)
@@ -370,6 +524,10 @@ class EnsembleStrategy(BaseStrategy):
             "signals_scaled": self._signals_scaled,
             "signals_blocked": self._signals_blocked,
             "signals_by_regime": {r: dict(s) for r, s in self._signals_by_regime.items()},
+            "confluence_vwap_blocked": self._confluence_vwap_blocked,
+            "confluence_volume_blocked": self._confluence_volume_blocked,
+            "confluence_lunch_blocked": self._confluence_lunch_blocked,
+            "confluence_passed": self._confluence_passed,
         }
 
     def print_funnel(self):
@@ -385,8 +543,30 @@ class EnsembleStrategy(BaseStrategy):
                 print(f"    {regime:>10}: {count:>6} ({pct:>5.1f}%) {bar}")
 
         print(f"\n  Signal Routing:")
-        print(f"    Signals scaled:  {self._signals_scaled:>6}")
-        print(f"    Signals blocked: {self._signals_blocked:>6}  (wrong regime)")
+        print(f"    Signals scaled:      {self._signals_scaled:>6}")
+        print(f"    Signals blocked:     {self._signals_blocked:>6}  (wrong regime)")
+        print(f"    Trend blocked:       {self._signals_trend_blocked:>6}  (counter-trend BOS/MA)")
+
+        # Confluence filter stats
+        total_conf_blocked = (self._confluence_vwap_blocked +
+                              self._confluence_volume_blocked +
+                              self._confluence_lunch_blocked)
+        if total_conf_blocked > 0 or self._confluence_passed > 0:
+            print(f"\n  Confluence Filters (prop firm quality gate):")
+            print(f"    VWAP gate blocked:   {self._confluence_vwap_blocked:>6}  (long below VWAP / short above)")
+            print(f"    Volume blocked:      {self._confluence_volume_blocked:>6}  (vol < 1.2x avg)")
+            print(f"    Lunch lull blocked:  {self._confluence_lunch_blocked:>6}  (12:00-13:00 ET)")
+            print(f"    ──────────────────────────────")
+            print(f"    Total blocked:       {total_conf_blocked:>6}")
+            print(f"    Entries passed:      {self._confluence_passed:>6}  (high-quality signals)")
+            if self._confluence_passed + total_conf_blocked > 0:
+                pass_rate = self._confluence_passed / (self._confluence_passed + total_conf_blocked) * 100
+                print(f"    Pass rate:           {pass_rate:>5.1f}%")
+
+        # Show current trend direction per symbol
+        if self._htf_trend_per_symbol:
+            trends = ", ".join(f"{s}={t}" for s, t in sorted(self._htf_trend_per_symbol.items()))
+            print(f"    HTF trend:           {trends}")
 
         if self._signals_by_regime:
             print(f"\n  Signals by Regime × Strategy:")
