@@ -334,6 +334,7 @@ from strategies.ma_crossover import MACrossoverStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.vol_breakout import VolatilityBreakoutStrategy
 from strategies.ensemble import EnsembleStrategy
+from strategies.event_driven import EventDrivenStrategy
 
 # Strategy registry for easy lookup
 STRATEGY_REGISTRY = {
@@ -343,6 +344,7 @@ STRATEGY_REGISTRY = {
     "mean_reversion": MeanReversionStrategy,
     "vol_breakout": VolatilityBreakoutStrategy,
     "ensemble": EnsembleStrategy,
+    "event_driven": EventDrivenStrategy,
 }
 
 
