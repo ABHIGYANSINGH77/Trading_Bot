@@ -50,6 +50,12 @@ class MACrossoverStrategy:
             "target_atr_mult": 3.0,
             "trail_trigger_atr": 1.5,
             "max_hold_bars": 20,
+            # --- Issue #3 fix: confirmation before entry ---
+            "confirm_bars": 2,          # MA must stay crossed for 2 bars
+            # --- Issue #9 fix: minimum hold period ---
+            "min_hold_bars": 3,         # Don't exit within 3 bars of entry
+            # --- Cooldown after exit ---
+            "cooldown_bars": 2,         # Wait 2 bars after exit before re-entering
         }
         self.name = "ma_crossover"
         self.event_bus = event_bus
@@ -65,6 +71,11 @@ class MACrossoverStrategy:
         self._target_price: Dict[str, float] = {}
         self._original_stop: Dict[str, float] = {}
         self._bars_in_trade: Dict[str, int] = {}
+        # Issue #3: confirmation tracking
+        self._cross_direction: Dict[str, Optional[str]] = {}  # Which way MAs crossed
+        self._cross_count: Dict[str, int] = {}  # How many bars the cross held
+        # Issue #9: cooldown after exit
+        self._cooldown: Dict[str, int] = {}  # Bars since last exit
 
         self._funnel = {
             "bars_processed": 0,
@@ -79,6 +90,9 @@ class MACrossoverStrategy:
             "exits_trailing": 0,
             "exits_timeout": 0,
             "exits_flip": 0,
+            "confirm_skip": 0,     # Issue #3: cross not confirmed
+            "cooldown_skip": 0,    # Issue #9: in cooldown period
+            "min_hold_skip": 0,    # Issue #9: too early to exit
             "regime_high": 0,
             "regime_low": 0,
         }
@@ -99,6 +113,10 @@ class MACrossoverStrategy:
             "low": event.low, "close": event.close,
             "volume": event.volume,
         })
+
+        # Tick down cooldown
+        if symbol in self._cooldown and self._cooldown[symbol] > 0:
+            self._cooldown[symbol] -= 1
 
         signal = self._decide(symbol)
         if signal is not None:
@@ -125,16 +143,56 @@ class MACrossoverStrategy:
         regime = self._get_regime(symbol)
         strength = 1.0 if regime == "low" else 0.5
 
-        # --- Check exits first ---
+        # --- Check exits first (if in position) ---
         if current is not None:
             self._bars_in_trade[symbol] = self._bars_in_trade.get(symbol, 0) + 1
+
+            # Issue #9: minimum hold period — don't exit too quickly
+            bars_held = self._bars_in_trade.get(symbol, 0)
+            min_hold = self.params["min_hold_bars"]
+            if bars_held < min_hold:
+                # Only allow exits for stop loss (hard risk limit)
+                stop = self._stop_price.get(symbol, 0)
+                if current == "long" and current_price <= stop:
+                    pass  # Allow stop exit even during min hold
+                elif current == "short" and current_price >= stop:
+                    pass  # Allow stop exit even during min hold
+                else:
+                    self._funnel["min_hold_skip"] += 1
+                    self._funnel["no_change"] += 1
+                    return None
+
             exit_signal = self._check_exit(symbol, current_price, atr_val, desired)
             if exit_signal:
+                # Start cooldown
+                self._cooldown[symbol] = self.params["cooldown_bars"]
                 return exit_signal
             self._funnel["no_change"] += 1
             return None
 
-        # --- Flat: enter new position ---
+        # --- Issue #9: cooldown check ---
+        if self._cooldown.get(symbol, 0) > 0:
+            self._funnel["cooldown_skip"] += 1
+            return None
+
+        # --- Issue #3: confirmation check ---
+        # Track how many consecutive bars the cross has held
+        prev_cross = self._cross_direction.get(symbol)
+        if desired != prev_cross:
+            # New cross detected — start counting
+            self._cross_direction[symbol] = desired
+            self._cross_count[symbol] = 1
+            self._funnel["confirm_skip"] += 1
+            return None  # Don't enter yet, wait for confirmation
+        else:
+            self._cross_count[symbol] = self._cross_count.get(symbol, 0) + 1
+
+        # Need N consecutive bars confirming the cross
+        if self._cross_count.get(symbol, 0) < self.params["confirm_bars"]:
+            self._funnel["confirm_skip"] += 1
+            return None
+
+        # --- Confirmed: enter new position ---
         stop_mult = self.params["stop_atr_mult"]
         target_mult = self.params["target_atr_mult"]
 
@@ -311,6 +369,9 @@ class MACrossoverStrategy:
         print(f"  Bars processed:           {f['bars_processed']:>8,}")
         print(f"    ├─ Warmup:              {f['warmup_skip']:>8,}")
         print(f"    ├─ Already positioned:  {f['no_change']:>8,}")
+        print(f"    ├─ Confirm wait:        {f['confirm_skip']:>8,}  (cross not held {self.params['confirm_bars']} bars)")
+        print(f"    ├─ Cooldown:            {f['cooldown_skip']:>8,}  ({self.params['cooldown_bars']} bar wait after exit)")
+        print(f"    ├─ Min hold block:      {f['min_hold_skip']:>8,}  (< {self.params['min_hold_bars']} bars)")
         print(f"    ├─ Enter LONG:          {f['long_entries']:>8,}")
         print(f"    ├─ Enter SHORT:         {f['short_entries']:>8,}")
         print(f"    ├─ Exit long:           {f['long_exits']:>8,}")
