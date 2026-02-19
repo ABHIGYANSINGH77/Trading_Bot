@@ -59,6 +59,29 @@ class RiskManager:
         # If stop loss is 2% away, position size = (portfolio * risk_pct) / stop_distance
         self.risk_per_trade_pct = risk_config.get("risk_per_trade_pct", 0.03)  # 3%
 
+        # Issue #10: Hard max loss per trade — force close if breached
+        self.max_loss_per_trade_pct = risk_config.get("max_loss_per_trade_pct", 0.05)  # 5%
+
+        # Issue #11: Same-direction exposure limit
+        # Don't go >60% of portfolio in same direction across correlated tech stocks
+        self.max_same_direction_pct = risk_config.get("max_same_direction_pct", 0.60)
+
+        # --- Session management (intraday discipline) ---
+        # A prop firm intraday book is flat at market close. Period.
+        # No overnight risk on positions sized for intraday moves.
+        #
+        # session_close_time: force-flatten ALL positions at this time (HH, MM) ET
+        # entry_cutoff_time:  block NEW entries after this time — no point entering
+        #                     a position you'll be forced out of in minutes
+        #
+        # Defaults set for 15m bars. Call set_interval() to adjust for 1h/5m/etc.
+        self.session_close_time = (15, 45)   # Force exit at 15:45 ET (last 15m bar)
+        self.entry_cutoff_time = (15, 15)    # No new entries after 15:15 ET
+        self.session_management = risk_config.get("session_management", True)
+        self._session_exit_count = 0
+        self._entry_blocked_session_count = 0
+        self._session_flat_dates = set()     # Track which days we flattened
+
         # State tracking
         self._daily_start_value: Optional[float] = None
         self._current_date: Optional[date] = None
@@ -101,6 +124,52 @@ class RiskManager:
         # But never below $200 (commission floor)
         self.min_order_value = max(200, portfolio_value * 0.05)
 
+    def set_interval(self, interval: str) -> None:
+        """Configure session times based on bar interval.
+
+        For intraday intervals, adjusts session close and entry cutoff times
+        so positions are flattened before market close with enough time for
+        orderly exit (no chasing the 16:00 bell).
+
+        Bar timestamps = bar START time. The 15:45 bar covers 15:45→16:00.
+        So forcing exit at 15:45 means we exit at roughly the 16:00 price.
+        """
+        interval_lower = interval.lower().replace(" ", "")
+
+        if interval_lower in ("1d", "1wk", "1mo", "daily", "weekly", "monthly"):
+            # Swing/position timeframes — no session exit
+            self.session_management = False
+            return
+
+        # Intraday intervals — must flatten before close
+        self.session_management = True
+
+        if interval_lower in ("1h", "1hour", "60m", "60min", "60mins"):
+            # 1h bars: last bar at 15:00 covers 15:00-16:00
+            # Force exit at 15:00 (fills at ~16:00 close price)
+            # Block entries at 14:00 (need at least 1 hour to hold)
+            self.session_close_time = (15, 0)
+            self.entry_cutoff_time = (14, 0)
+        elif interval_lower in ("30m", "30min", "30mins"):
+            self.session_close_time = (15, 30)
+            self.entry_cutoff_time = (15, 0)
+        elif interval_lower in ("15m", "15min", "15mins"):
+            # 15m bars: last bar at 15:45 covers 15:45-16:00
+            # Force exit at 15:45 (fills at ~16:00 price)
+            # Block entries at 15:15 (need at least 30 min / 2 bars to hold)
+            self.session_close_time = (15, 45)
+            self.entry_cutoff_time = (15, 15)
+        elif interval_lower in ("5m", "5min", "5mins"):
+            self.session_close_time = (15, 55)
+            self.entry_cutoff_time = (15, 40)
+        elif interval_lower in ("1m", "1min", "1mins"):
+            self.session_close_time = (15, 59)
+            self.entry_cutoff_time = (15, 50)
+        else:
+            # Default: conservative
+            self.session_close_time = (15, 45)
+            self.entry_cutoff_time = (15, 15)
+
     def on_market_data(self, event: MarketDataEvent) -> None:
         """Track prices, bar timestamps, and check daily drawdown."""
         self._latest_prices[event.symbol] = event.close
@@ -135,6 +204,90 @@ class RiskManager:
             if not self._trading_halted:
                 self._halt_trading(f"Total drawdown limit breached: {self.portfolio.drawdown:.2%}", halt_type="total")
 
+        # Issue #10: Check each open position for max loss breach
+        # Force-close any position that's lost more than max_loss_per_trade_pct
+        for symbol, pos in list(self.portfolio.positions.items()):
+            if pos.is_flat:
+                continue
+            price = self._latest_prices.get(symbol, 0)
+            if price <= 0 or pos.avg_entry_price <= 0:
+                continue
+            if pos.quantity > 0:  # Long
+                loss_pct = (pos.avg_entry_price - price) / pos.avg_entry_price
+            else:  # Short
+                loss_pct = (price - pos.avg_entry_price) / pos.avg_entry_price
+
+            if loss_pct > self.max_loss_per_trade_pct:
+                # Force close — bypass all risk checks including halt
+                exit_type = SignalType.EXIT_LONG if pos.quantity > 0 else SignalType.EXIT_SHORT
+                force_signal = SignalEvent(
+                    symbol=symbol,
+                    signal_type=exit_type,
+                    strength=0.0,
+                    strategy_name="risk_manager",
+                    metadata={
+                        "exit_reason": "max_loss_breach",
+                        "loss_pct": round(loss_pct * 100, 2),
+                        "entry_price": pos.avg_entry_price,
+                        "current_price": price,
+                    },
+                )
+                self._log_risk_event("FORCE_EXIT", symbol, "risk_manager",
+                    f"Max loss {loss_pct:.1%} > {self.max_loss_per_trade_pct:.0%} limit "
+                    f"(entry=${pos.avg_entry_price:.2f} now=${price:.2f})")
+                # Direct order creation — bypass on_signal to avoid halt blocking
+                qty = abs(pos.quantity)
+                side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+                order = OrderEvent(
+                    symbol=symbol, order_type=OrderType.MARKET,
+                    side=side, quantity=qty,
+                    strategy_name="risk_manager",
+                )
+                self.event_bus.publish(order)
+
+        # --- SESSION CLOSE: Force-flatten all positions at end of day ---
+        # This is the core intraday discipline. No overnight holds.
+        # Runs on EVERY bar for EVERY symbol, but only triggers at session close time.
+        if self.session_management:
+            ts = event.bar_timestamp or event.timestamp
+            bar_hour = getattr(ts, 'hour', None)
+            bar_min = getattr(ts, 'minute', 0)
+            bar_date = getattr(ts, 'date', lambda: None)()
+
+            if bar_hour is not None and bar_date is not None:
+                close_h, close_m = self.session_close_time
+
+                # Are we at or past session close time?
+                at_close = (bar_hour > close_h) or (bar_hour == close_h and bar_min >= close_m)
+
+                # Only flatten once per day (avoid re-triggering on every late bar)
+                if at_close and bar_date not in self._session_flat_dates:
+                    has_positions = False
+                    for symbol, pos in list(self.portfolio.positions.items()):
+                        if pos.is_flat:
+                            continue
+                        has_positions = True
+                        qty = abs(pos.quantity)
+                        side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+                        direction = "LONG" if pos.quantity > 0 else "SHORT"
+                        price = self._latest_prices.get(symbol, 0)
+
+                        self._log_risk_event("SESSION_EXIT", symbol, "risk_manager",
+                            f"Flatten {direction} {qty} @ ~${price:.2f} "
+                            f"(session close {close_h}:{close_m:02d})")
+
+                        order = OrderEvent(
+                            symbol=symbol, order_type=OrderType.MARKET,
+                            side=side, quantity=qty,
+                            strategy_name="session_close",
+                            timestamp=ts,
+                        )
+                        self.event_bus.publish(order)
+                        self._session_exit_count += 1
+
+                    if has_positions:
+                        self._session_flat_dates.add(bar_date)
+
     def on_fill(self, event: FillEvent) -> None:
         """Remove filled orders from open orders tracking."""
         if event.order_id in self._open_orders:
@@ -146,6 +299,24 @@ class RiskManager:
             self._log_risk_event("BLOCKED", signal.symbol, signal.strategy_name,
                                  f"Trading halted: {self._halt_reason}")
             return
+
+        # --- Session entry cutoff: block NEW entries near market close ---
+        # Exits always allowed (we WANT to close before session end).
+        # Only block LONG/SHORT entries, not EXIT signals.
+        is_entry = signal.signal_type in (SignalType.LONG, SignalType.SHORT)
+        if is_entry and self.session_management and self._latest_bar_time:
+            ts = self._latest_bar_time
+            bar_hour = getattr(ts, 'hour', None)
+            bar_min = getattr(ts, 'minute', 0)
+            if bar_hour is not None:
+                cutoff_h, cutoff_m = self.entry_cutoff_time
+                past_cutoff = (bar_hour > cutoff_h) or (bar_hour == cutoff_h and bar_min >= cutoff_m)
+                if past_cutoff:
+                    self._entry_blocked_session_count += 1
+                    self._log_risk_event("BLOCKED", signal.symbol, signal.strategy_name,
+                        f"Entry blocked: past session cutoff "
+                        f"{cutoff_h}:{cutoff_m:02d} (bar={bar_hour}:{bar_min:02d})")
+                    return
 
         order = self._signal_to_order(signal)
         if order is None:
@@ -319,6 +490,25 @@ class RiskManager:
                 return False, (
                     f"Position size {position_pct:.1%} would exceed limit "
                     f"{self.max_position_pct:.1%} for {order.symbol}"
+                )
+
+            # Issue #11: Same-direction exposure check
+            # If buying, check total long exposure; if selling, total short exposure
+            is_buying = order.side == OrderSide.BUY
+            same_dir_exposure = new_position_value
+            for sym, pos in self.portfolio.positions.items():
+                if sym == order.symbol:
+                    continue
+                if is_buying and pos.quantity > 0:
+                    same_dir_exposure += abs(pos.market_value)
+                elif not is_buying and pos.quantity < 0:
+                    same_dir_exposure += abs(pos.market_value)
+
+            same_dir_pct = same_dir_exposure / portfolio_value
+            if same_dir_pct > self.max_same_direction_pct:
+                return False, (
+                    f"Same-direction exposure {same_dir_pct:.1%} would exceed "
+                    f"{self.max_same_direction_pct:.1%} limit"
                 )
 
             # Check: portfolio leverage
