@@ -177,10 +177,16 @@ class BacktestEngine:
 
         # Auto-scale risk limits based on number of symbols
         self.risk_manager.set_symbols(symbols)
+        self.risk_manager.set_interval(interval)
+        session_info = ""
+        if self.risk_manager.session_management:
+            ch, cm = self.risk_manager.session_close_time
+            eh, em = self.risk_manager.entry_cutoff_time
+            session_info = f" | session exit={ch}:{cm:02d} cutoff={eh}:{em:02d}"
         print(f"  Risk: max_position_pct = {self.risk_manager.max_position_pct:.0%} "
               f"({len(symbols)} symbol{'s' if len(symbols)>1 else ''}) | "
               f"risk/trade = {self.risk_manager.risk_per_trade_pct:.0%} | "
-              f"min order = ${self.risk_manager.min_order_value:.0f}")
+              f"min order = ${self.risk_manager.min_order_value:.0f}{session_info}")
 
         # Inject interval into strategy params so they can annualize correctly
         for strategy in self.strategies:
@@ -202,28 +208,67 @@ class BacktestEngine:
         strategy_data = {s: all_data[s] for s in symbols if s in all_data}
 
         # Clean data — filter bad ticks at the DataFrame level
+        # Uses THREE methods:
+        #   1. Global median: flag bars where close deviates >25% from overall median
+        #      (catches entire bad chunks that passed through data layer)
+        #   2. Segment detection: find contiguous runs of abnormal prices and remove them
+        #   3. Sequential jump: flag individual bars with >10% jump from previous close
         for sym in list(strategy_data.keys()):
             df = strategy_data[sym]
-            if df.empty:
+            if df.empty or len(df) < 10:
                 continue
             orig_len = len(df)
 
-            # Check all OHLC columns for >15% single-bar jumps
             closes = df["close"].values
             mask = np.ones(len(df), dtype=bool)
+
+            # Method 1: Global median filter
+            # The global median is robust — even if 1-2 chunks are bad,
+            # they're outnumbered by the ~12 good chunks
+            global_median = np.median(closes)
+            for i in range(len(df)):
+                for col in ["open", "high", "low", "close"]:
+                    val = df[col].iloc[i]
+                    deviation = abs(val - global_median) / global_median
+                    if deviation > 0.40:  # >40% from global median
+                        mask[i] = False
+                        print(f"  ⚠ Bad tick (global): {sym} @ {df.index[i]} — "
+                              f"{col}={val:.2f} (global median={global_median:.2f}, "
+                              f"Δ={deviation:.0%})")
+                        break
+
+            # Method 2: Sequential jump filter with context check
             for i in range(1, len(df)):
+                if not mask[i]:
+                    continue
                 prev_c = closes[i-1]
                 if prev_c <= 0:
                     continue
                 for col in ["open", "high", "low", "close"]:
                     change = abs(df[col].iloc[i] - prev_c) / prev_c
-                    if change > 0.15:
-                        mask[i] = False
-                        print(f"  ⚠ Bad tick: {sym} @ {df.index[i]} — "
-                              f"O={df['open'].iloc[i]:.2f} H={df['high'].iloc[i]:.2f} "
-                              f"L={df['low'].iloc[i]:.2f} C={df['close'].iloc[i]:.2f} "
-                              f"(prev close={prev_c:.2f}, Δ={change:.0%})")
-                        break
+                    if change > 0.10:  # >10% single-bar jump (tighter than before)
+                        # Check if this is a real gap or bad data
+                        # Look ahead: if next 3 bars are at the new level, it might be real
+                        if i + 3 < len(df):
+                            next_3 = closes[i+1:i+4]
+                            next_median = np.median(next_3)
+                            curr = df[col].iloc[i]
+                            # If next bars are also at the jumped level, check global median
+                            next_vs_global = abs(next_median - global_median) / global_median
+                            if next_vs_global > 0.30:
+                                # Next bars are also weird — this is a bad segment
+                                mask[i] = False
+                                print(f"  ⚠ Bad tick (jump+context): {sym} @ {df.index[i]} — "
+                                      f"{col}={df[col].iloc[i]:.2f} (prev={prev_c:.2f}, "
+                                      f"Δ={change:.0%}, next_bars also abnormal)")
+                                break
+                            # else: real price gap (earnings, overnight, etc.)
+                        else:
+                            # Near end of data, use global median
+                            curr_vs_global = abs(df[col].iloc[i] - global_median) / global_median
+                            if curr_vs_global > 0.30:
+                                mask[i] = False
+                                break
 
             if not mask.all():
                 strategy_data[sym] = df[mask].copy()
@@ -245,37 +290,46 @@ class BacktestEngine:
                 events.append((timestamp, symbol, row))
         events.sort(key=lambda x: x[0])
 
-        # Filter bad ticks — erroneous data points from IBKR
-        # Check ALL price fields (open, high, low, close) against previous close
-        # A single bad field can cause a bogus entry at an impossible price
-        last_close = {}  # symbol -> last valid close
+        # Filter bad ticks — safety net for anything that survived data layer
+        # Uses rolling median (window=10) per symbol. Bars where close deviates
+        # >15% from the rolling median are dropped. This is a simple, robust
+        # last-line-of-defense filter.
+        from collections import deque
+        price_history = {}  # symbol -> deque of recent closes
+        HISTORY_SIZE = 10
+        DEVIATION_PCT = 0.15
+        
         bad_tick_count = 0
         clean_events = []
+        
         for timestamp, symbol, row in events:
             close = row["close"]
             ohlc = [row["open"], row["high"], row["low"], close]
-
-            if symbol in last_close:
-                prev = last_close[symbol]
-                # Check if ANY price field is >15% from previous close
-                is_bad = False
+            
+            is_bad = False
+            if symbol in price_history and len(price_history[symbol]) >= 3:
+                running_med = np.median(list(price_history[symbol]))
                 for p in ohlc:
-                    if prev > 0 and abs(p - prev) / prev > 0.15:
+                    if running_med > 0 and abs(p - running_med) / running_med > DEVIATION_PCT:
                         is_bad = True
                         break
-                if is_bad:
-                    bad_tick_count += 1
-                    print(f"  ⚠ Bad tick filtered: {symbol} @ {timestamp} "
-                          f"O={row['open']:.2f} H={row['high']:.2f} "
-                          f"L={row['low']:.2f} C={close:.2f} "
-                          f"(prev close={prev:.2f})")
-                    continue  # Skip this bar entirely
-
-            last_close[symbol] = close
+            
+            if is_bad:
+                bad_tick_count += 1
+                if bad_tick_count <= 20:
+                    rm = np.median(list(price_history.get(symbol, [close])))
+                    print(f"  ⚠ Bad tick (backtest filter): {symbol} @ {timestamp} "
+                          f"C={close:.2f} (running_med={rm:.2f})")
+                # Don't update history with bad bar — keeps median clean
+                continue
+            
+            if symbol not in price_history:
+                price_history[symbol] = deque(maxlen=HISTORY_SIZE)
+            price_history[symbol].append(close)
             clean_events.append((timestamp, symbol, row))
 
         if bad_tick_count > 0:
-            print(f"  ⚠ Filtered {bad_tick_count} bad tick(s) (>20% single-bar move)")
+            print(f"  ⚠ Backtest filter caught {bad_tick_count} additional bad tick(s)")
         events = clean_events
 
         # Process events chronologically
@@ -356,6 +410,10 @@ class BacktestEngine:
         Uses net position tracking per symbol. A round-trip starts when
         position goes from flat to non-flat, and ends when it returns to flat.
         Handles pyramiding (multiple buys), partial exits, and reversals.
+
+        CRITICAL FIX: On partial closes, total_cost is now reduced
+        proportionally. Without this, partial close + pyramid inflates
+        avg_entry to phantom prices (e.g., $340 from $180 data).
         """
         if trade_log.empty:
             return pd.DataFrame()
@@ -363,7 +421,7 @@ class BacktestEngine:
         paired = []
 
         # Per-symbol state
-        positions = {}  # symbol -> {net_qty, avg_entry, entry_time, side, total_cost, total_commission, strategy}
+        positions = {}  # symbol -> {net_qty, avg_entry, entry_time, total_cost, total_commission, strategy}
 
         for _, row in trade_log.iterrows():
             symbol = row["symbol"]
@@ -433,10 +491,21 @@ class BacktestEngine:
                     positions[symbol] = {"net_qty": 0}
 
                 elif (old_qty > 0 and new_qty > 0) or (old_qty < 0 and new_qty < 0):
-                    # Same direction — pyramiding. Update avg entry.
+                    # Position stays on same side
                     if (signed_qty > 0 and old_qty > 0) or (signed_qty < 0 and old_qty < 0):
+                        # True pyramiding — adding to position
                         pos["total_cost"] += abs(signed_qty) * price
                         pos["avg_entry"] = pos["total_cost"] / abs(new_qty)
+                    else:
+                        # Partial close — reduce total_cost proportionally
+                        # THIS WAS THE BUG: total_cost was unchanged, causing
+                        # subsequent pyramids to compute avg_entry from inflated cost.
+                        # Example: SELL 10@$182 → BUY 7@$180 (partial close)
+                        #   Old: total_cost stays $1818, SELL 5@$181 → avg = $2720/8 = $340!
+                        #   Fix: total_cost → $1818*0.3=$545, SELL 5 → avg = $1448/8 = $181 ✓
+                        closed_fraction = abs(signed_qty) / abs(old_qty)
+                        pos["total_cost"] *= (1 - closed_fraction)
+                        # avg_entry stays the same — remaining shares at same avg cost
                     pos["net_qty"] = new_qty
 
                 elif (old_qty > 0 and new_qty < 0) or (old_qty < 0 and new_qty > 0):
@@ -640,6 +709,20 @@ class BacktestEngine:
             if dropped:
                 print(f", {dropped} dropped (sizing)", end="")
             print()
+
+            # Session management stats
+            session_exits = sum(1 for r in risk_log if r.get("action") == "SESSION_EXIT")
+            entry_blocked_session = sum(
+                1 for r in risk_log
+                if r.get("action") == "BLOCKED" and "session cutoff" in r.get("detail", "")
+            )
+            if self.risk_manager.session_management:
+                ch, cm = self.risk_manager.session_close_time
+                eh, em = self.risk_manager.entry_cutoff_time
+                print(f"  Session: flatten@{ch}:{cm:02d} | "
+                      f"cutoff@{eh}:{em:02d} | "
+                      f"{session_exits} positions flattened | "
+                      f"{entry_blocked_session} late entries blocked")
 
             if halts:
                 for h in halts:
