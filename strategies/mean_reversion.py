@@ -173,8 +173,22 @@ class MeanReversionStrategy(BaseStrategy):
         band_width = upper_band - lower_band
         band_tolerance = band_width * 0.10  # Within 10% of the band
 
+        # --- TREND-AWARE DIRECTION ---
+        # The ensemble pushes HTF trend to us via _htf_trend[symbol].
+        # In a downtrend, "buying the dip" is catching a falling knife.
+        # In an uptrend, "shorting the rip" fights momentum.
+        # Only take the direction aligned with macro trend.
+        #
+        # Bearish trend: only SHORT at upper band (price will revert DOWN)
+        # Bullish trend: only LONG at lower band (price will revert UP)
+        # Neutral: take both directions
+        htf_trend = getattr(self, '_htf_trend', {}).get(symbol, "neutral")
+
         # Long: price near lower band + RSI oversold
-        if price <= lower_band + band_tolerance and rsi_val < self.params["rsi_oversold"]:
+        # ONLY in bullish or neutral trend — NOT in bearish (falling knife!)
+        if (price <= lower_band + band_tolerance
+                and rsi_val < self.params["rsi_oversold"]
+                and htf_trend != "bearish"):
             stop = price - self.params["atr_stop_mult"] * atr_val
             self._in_position[symbol] = "long"
             self._entry_price[symbol] = price
@@ -184,13 +198,18 @@ class MeanReversionStrategy(BaseStrategy):
 
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.LONG,
-                strength=0.8, strategy_name=self.name,
+                strength=0.9 if htf_trend == "bullish" else 0.7,
+                strategy_name=self.name,
                 metadata={"entry": price, "stop": stop, "target": middle_band,
-                          "rsi": rsi_val, "adx": adx_val, "band": "lower"},
+                          "rsi": rsi_val, "adx": adx_val, "band": "lower",
+                          "htf_trend": htf_trend},
             )
 
         # Short: price near upper band + RSI overbought
-        if price >= upper_band - band_tolerance and rsi_val > self.params["rsi_overbought"]:
+        # ONLY in bearish or neutral trend — NOT in bullish (fighting momentum!)
+        if (price >= upper_band - band_tolerance
+                and rsi_val > self.params["rsi_overbought"]
+                and htf_trend != "bullish"):
             stop = price + self.params["atr_stop_mult"] * atr_val
             self._in_position[symbol] = "short"
             self._entry_price[symbol] = price
@@ -200,10 +219,18 @@ class MeanReversionStrategy(BaseStrategy):
 
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.SHORT,
-                strength=0.8, strategy_name=self.name,
+                strength=0.9 if htf_trend == "bearish" else 0.7,
+                strategy_name=self.name,
                 metadata={"entry": price, "stop": stop, "target": middle_band,
-                          "rsi": rsi_val, "adx": adx_val, "band": "upper"},
+                          "rsi": rsi_val, "adx": adx_val, "band": "upper",
+                          "htf_trend": htf_trend},
             )
+
+        # Track: if we had a band touch but trend blocked the wrong direction
+        if price <= lower_band + band_tolerance and rsi_val < self.params["rsi_oversold"] and htf_trend == "bearish":
+            self._funnel["trend_filtered"] = self._funnel.get("trend_filtered", 0) + 1
+        if price >= upper_band - band_tolerance and rsi_val > self.params["rsi_overbought"] and htf_trend == "bullish":
+            self._funnel["trend_filtered"] = self._funnel.get("trend_filtered", 0) + 1
 
         self._funnel["no_signal"] += 1
         return None
@@ -254,12 +281,15 @@ class MeanReversionStrategy(BaseStrategy):
         f = self._funnel
         entries = f["long_entries"] + f["short_entries"]
         exits = f["exits_target"] + f["exits_stop"] + f["exits_timeout"]
+        tf = f.get("trend_filtered", 0)
         print(f"\n  SIGNAL FUNNEL — {self.name}")
         print(f"  {'─'*50}")
         print(f"  Bars processed:           {f['bars_processed']:>8,}")
         print(f"    ├─ In position:         {f['in_position']:>8,}")
         print(f"    ├─ ADX too high:        {f['filtered_adx']:>8,}  (trending → skip)")
         print(f"    ├─ No band touch:       {f['no_signal']:>8,}")
+        if tf > 0:
+            print(f"    ├─ Trend aligned:       {tf:>8,}  (wrong dir for HTF trend)")
         print(f"    ├─ Enter LONG:          {f['long_entries']:>8,}  (lower band + RSI)")
         print(f"    └─ Enter SHORT:         {f['short_entries']:>8,}  (upper band + RSI)")
         print(f"  {'─'*50}")
