@@ -340,6 +340,7 @@ class EnsembleStrategy(BaseStrategy):
         self._confluence_vwap_blocked = 0
         self._confluence_volume_blocked = 0
         self._confluence_lunch_blocked = 0
+        self._confluence_rr_blocked = 0        # NEW: bad risk:reward ratio
         self._confluence_passed = 0
 
     def _on_market_data_ensemble(self, event: MarketDataEvent):
@@ -398,6 +399,15 @@ class EnsembleStrategy(BaseStrategy):
         htf_trend = _higher_tf_trend(bars, multiplier=4)
         self._htf_trend_per_symbol[symbol] = htf_trend
 
+        # --- PUSH HTF TREND TO SUB-STRATEGIES ---
+        # Instead of blocking counter-trend signals at the ensemble level,
+        # let each strategy KNOW the trend so it generates the RIGHT direction.
+        # This is the key insight: don't filter — INFORM.
+        for strat in self._sub_strategies.values():
+            if not hasattr(strat, '_htf_trend'):
+                strat._htf_trend = {}
+            strat._htf_trend[symbol] = htf_trend
+
     def _intercept_publish(self, event):
         """Intercept signal events and scale them based on regime."""
         if (hasattr(event, 'event_type') and event.event_type == EventType.SIGNAL
@@ -442,11 +452,15 @@ class EnsembleStrategy(BaseStrategy):
                     event.strength = min(event.strength * 1.3, 1.0)
                     event.metadata["htf_aligned"] = True
 
-            # For non-trend strategies, reduce counter-trend but don't block
+            # For non-trend strategies (mean_reversion, vol_breakout):
+            # These strategies now have HTF trend passed to them and handle
+            # direction alignment internally. We don't block here — we let
+            # them generate the RIGHT direction signal in the first place.
+            # Boost trend-aligned signals from non-trend strategies.
             elif not is_trend_strategy and htf_trend != "neutral":
-                if (is_long and htf_trend == "bearish") or (is_short and htf_trend == "bullish"):
-                    event.strength *= 0.5
-                    event.metadata["htf_conflict"] = True
+                if (is_long and htf_trend == "bullish") or (is_short and htf_trend == "bearish"):
+                    event.strength = min(event.strength * 1.3, 1.0)
+                    event.metadata["htf_aligned"] = True
 
             # ═══════════════════════════════════════════════════════════
             #  CONFLUENCE FILTERS — Applied to ALL entry signals
@@ -510,6 +524,27 @@ class EnsembleStrategy(BaseStrategy):
                 event.metadata["confluence_ok"] = True
                 event.metadata["vwap"] = round(self._current_vwap.get(symbol, 0), 2)
 
+                # --- 4. MINIMUM RISK:REWARD GATE ---
+                # Don't enter trades where the potential reward doesn't
+                # justify the risk. Require at least 1.5:1 R:R.
+                # This catches mean_reversion trades where target (middle band)
+                # is closer than the stop — inverted R:R.
+                entry_price = self._bar_history[symbol][-1]["close"] if self._bar_history[symbol] else 0
+                stop_price = event.metadata.get("stop", 0)
+                target_price = event.metadata.get("target", 0)
+                if entry_price > 0 and stop_price > 0 and target_price > 0:
+                    risk = abs(entry_price - stop_price)
+                    reward = abs(target_price - entry_price)
+                    if risk > 0:
+                        rr_ratio = reward / risk
+                        event.metadata["rr_ratio"] = round(rr_ratio, 2)
+                        if rr_ratio < 1.5:
+                            self._confluence_rr_blocked += 1
+                            event.metadata["blocked_reason"] = f"bad_rr_{rr_ratio:.1f}"
+                            # Undo the passed count
+                            self._confluence_passed -= 1
+                            return  # BLOCKED: risk > reward
+
         # Publish via original method
         self._original_publish(event)
 
@@ -527,6 +562,7 @@ class EnsembleStrategy(BaseStrategy):
             "confluence_vwap_blocked": self._confluence_vwap_blocked,
             "confluence_volume_blocked": self._confluence_volume_blocked,
             "confluence_lunch_blocked": self._confluence_lunch_blocked,
+            "confluence_rr_blocked": self._confluence_rr_blocked,
             "confluence_passed": self._confluence_passed,
         }
 
@@ -550,12 +586,14 @@ class EnsembleStrategy(BaseStrategy):
         # Confluence filter stats
         total_conf_blocked = (self._confluence_vwap_blocked +
                               self._confluence_volume_blocked +
-                              self._confluence_lunch_blocked)
+                              self._confluence_lunch_blocked +
+                              self._confluence_rr_blocked)
         if total_conf_blocked > 0 or self._confluence_passed > 0:
             print(f"\n  Confluence Filters (prop firm quality gate):")
             print(f"    VWAP gate blocked:   {self._confluence_vwap_blocked:>6}  (long below VWAP / short above)")
             print(f"    Volume blocked:      {self._confluence_volume_blocked:>6}  (vol < 1.2x avg)")
             print(f"    Lunch lull blocked:  {self._confluence_lunch_blocked:>6}  (12:00-13:00 ET)")
+            print(f"    Bad R:R blocked:     {self._confluence_rr_blocked:>6}  (reward/risk < 1.5)")
             print(f"    ──────────────────────────────")
             print(f"    Total blocked:       {total_conf_blocked:>6}")
             print(f"    Entries passed:      {self._confluence_passed:>6}  (high-quality signals)")
