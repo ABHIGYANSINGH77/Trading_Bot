@@ -738,3 +738,128 @@ def compute_all_features(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
     out["lower_wick_pct"] = np.where(full_range > 0, (np.minimum(o, c) - l) / full_range, 0)
 
     return out
+
+
+# ================================================================
+#  Regime Classifier — categorizes current market environment
+# ================================================================
+
+class RegimeClassifier:
+    """Classifies market regime from price data.
+
+    Regimes:
+        calm     — Low vol, normal ranges. Best for breakouts. Full size.
+        trending — Directional flow. Only trade with-trend. Full size w/trend.
+        volatile — Wide ranges, unclear direction. Half size, high bar.
+        crisis   — Extreme vol, gaps. Quarter size, near-impossible bar.
+
+    Each regime controls:
+        score_threshold: how high event score must be to trade
+        risk_scale:      position size multiplier (1.0 = full)
+    """
+
+    REGIMES = {
+        "calm": {
+            "score_threshold": 5,
+            "risk_scale": 1.0,
+        },
+        "trending": {
+            "score_threshold": 7,       # P2 fix: was 5, raised to filter noise
+            "risk_scale": 1.0,
+            "risk_scale_counter": 0.3,  # P2 fix: was 0.5, reduced further
+        },
+        "volatile": {
+            "score_threshold": 8,       # P2 fix: was 7
+            "risk_scale": 0.5,
+        },
+        "crisis": {
+            "score_threshold": 10,      # P2 fix: was 9, effectively skip
+            "risk_scale": 0.25,
+        },
+    }
+
+    def classify(self, close: np.ndarray, high: np.ndarray,
+                 low: np.ndarray, gap_pct: float = 0.0) -> Dict:
+        """Classify current regime from price arrays."""
+        if len(close) < 60:
+            return self._default_regime()
+
+        # ATR percentile — where is current vol vs recent history
+        atr_vals = atr(high, low, close, 14)
+        current_atr = atr_vals[-1]
+        if np.isnan(current_atr):
+            return self._default_regime()
+
+        lookback = min(100, len(atr_vals))
+        recent_atr = atr_vals[-lookback:]
+        valid_atr = recent_atr[~np.isnan(recent_atr)]
+        if len(valid_atr) < 20:
+            return self._default_regime()
+
+        atr_pct = float(np.sum(valid_atr <= current_atr) / len(valid_atr) * 100)
+
+        # Trend detection — EMA(20) vs EMA(50) spread + slope
+        ema_20 = ema(close, 20)
+        ema_50 = ema(close, 50)
+        if np.isnan(ema_20[-1]) or np.isnan(ema_50[-1]) or ema_50[-1] == 0:
+            return self._default_regime()
+
+        spread = (ema_20[-1] - ema_50[-1]) / ema_50[-1]
+        slope_20 = (ema_20[-1] - ema_20[-6]) / ema_20[-6] if not np.isnan(ema_20[-6]) else 0
+
+        trend_strength = abs(spread)
+        if spread > 0.002 and slope_20 > 0:
+            trend_dir = "bullish"
+        elif spread < -0.002 and slope_20 < 0:
+            trend_dir = "bearish"
+        else:
+            trend_dir = "neutral"
+
+        # Classify regime
+        abs_gap = abs(gap_pct)
+        if abs_gap > 0.02 or atr_pct > 90:
+            regime = "crisis"
+        elif atr_pct > 70:
+            regime = "volatile"
+        elif trend_strength > 0.005 and trend_dir != "neutral":
+            regime = "trending"
+        else:
+            regime = "calm"
+
+        config = self.REGIMES[regime]
+        return {
+            "regime": regime,
+            "regime_label": regime.upper(),
+            "atr_percentile": atr_pct,
+            "trend_direction": trend_dir,
+            "trend_strength": trend_strength,
+            "risk_scale": config["risk_scale"],
+            "score_threshold": config["score_threshold"],
+        }
+
+    def get_risk_scale(self, regime: str, event_direction: str,
+                       trend_direction: str) -> float:
+        """Risk scale considering regime + trend alignment."""
+        config = self.REGIMES.get(regime, self.REGIMES["calm"])
+        base_scale = config["risk_scale"]
+
+        if regime == "trending" and trend_direction != "neutral":
+            is_with_trend = (
+                (event_direction == "LONG" and trend_direction == "bullish") or
+                (event_direction == "SHORT" and trend_direction == "bearish")
+            )
+            if not is_with_trend:
+                base_scale = config.get("risk_scale_counter", 0.3)
+
+        return base_scale
+
+    def _default_regime(self) -> Dict:
+        return {
+            "regime": "calm",
+            "regime_label": "CALM",
+            "atr_percentile": 50.0,
+            "trend_direction": "neutral",
+            "trend_strength": 0.0,
+            "risk_scale": 0.75,
+            "score_threshold": 6,
+        }
