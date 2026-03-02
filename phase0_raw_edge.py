@@ -12,6 +12,22 @@ Method:
   - Target = none (we measure where price goes by EOD).
   - We record everything and decompose by every dimension.
 
+Output:
+  - Raw expectancy in R-multiples
+  - Win rate (did price continue in breakout direction by EOD?)
+  - Distribution of max favorable / max adverse excursion
+  - Chase measurement: how far past ORB boundary did we enter?
+  - Decomposition by: symbol, direction, time of day, ORB width, volume, gap
+
+Success criteria: Expectancy > +0.05R across 100+ trades.
+If this fails, ORB breakout has no edge on these instruments at 15m.
+
+Usage:
+  python3 phase0_raw_edge.py ./data/cache/AAPL_2025-07-01_2025-12-1_15_mins.csv \
+                              ./data/cache/NVDA_2025-07-01_2025-12-1_15_mins.csv \
+                              ./data/cache/MSFT_2025-07-01_2025-12-1_15_mins.csv \
+                              ./data/cache/AMZN_2025-07-01_2025-12-1_15_mins.csv \
+                              ./data/cache/GOOG_2025-07-01_2025-12-1_15_mins.csv
 """
 
 import sys
