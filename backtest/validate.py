@@ -303,6 +303,223 @@ def monte_carlo(
     }
 
 
+def markov_monte_carlo(
+    trade_pnls: np.ndarray,
+    n_simulations: int = 1000,
+    initial_capital: float = 10_000,
+) -> Dict:
+    """Regime-switching Monte Carlo using a 2-state Markov chain.
+
+    Standard bootstrap MC resamples trades assuming risk is stationary.
+    Real markets concentrate risk in regimes: calm periods of low volatility
+    and stressed periods where losses cluster and drawdowns compound.
+
+    This model:
+      1. Classifies each trade into Calm (low vol) or Stressed (high vol)
+         based on rolling 5-trade return volatility vs the median.
+      2. Estimates a 2x2 Markov transition matrix from the observed
+         regime sequence — capturing how long regimes tend to persist.
+      3. Simulates N paths where the next trade's regime depends on the
+         current regime via the transition probabilities, and returns are
+         drawn from that regime's distribution.
+
+    Key insight: if we are currently Stressed and T[Stressed→Stressed] is
+    high, the conditional 95th-percentile drawdown will significantly exceed
+    the standard MC estimate — repricing risk on a regime-conditional basis.
+
+    Returns same keys as monte_carlo() plus regime diagnostics.
+    """
+    _EMPTY: Dict = {
+        "median_return": 0, "mean_return": 0,
+        "p5_return": 0, "p25_return": 0, "p75_return": 0, "p95_return": 0,
+        "p5_drawdown": 0, "median_drawdown": 0, "p95_drawdown": 0,
+        "prob_profitable": 0, "prob_ruin": 0,
+        "n_simulations": n_simulations, "n_trades": 0,
+        "all_returns": np.array([]), "all_drawdowns": np.array([]),
+        "path_equities": [], "transition_matrix": None,
+        "current_regime": 0, "regime_names": ["Calm", "Stressed"],
+        "regime_labels": [], "regime_mean": [0.0, 0.0],
+        "regime_std": [0.01, 0.01], "initial_capital": initial_capital,
+    }
+    if len(trade_pnls) < 6:
+        return _EMPTY
+
+    n_trades = len(trade_pnls)
+    fracs = trade_pnls / initial_capital
+
+    # ── Step 1: Regime detection via rolling volatility ───────────────
+    window = max(3, min(5, n_trades // 4))
+    rolling_vol = np.array([
+        np.std(fracs[max(0, i - window): i + 1])
+        for i in range(n_trades)
+    ])
+    vol_threshold = np.median(rolling_vol)
+    regimes = (rolling_vol >= vol_threshold).astype(int)  # 0=Calm, 1=Stressed
+
+    # ── Step 2: Transition matrix with Laplace smoothing ─────────────
+    # Start with 1-count prior (Laplace smoothing) to avoid zero probs
+    T = np.ones((2, 2), dtype=float)
+    for i in range(len(regimes) - 1):
+        T[regimes[i], regimes[i + 1]] += 1.0
+    T /= T.sum(axis=1, keepdims=True)
+
+    # ── Step 3: Per-regime return distributions ───────────────────────
+    regime_fracs = [fracs[regimes == r] for r in range(2)]
+    regime_mean = np.array([
+        r.mean() if len(r) > 0 else fracs.mean()
+        for r in regime_fracs
+    ])
+    regime_std = np.maximum(
+        np.array([r.std() if len(r) > 1 else fracs.std() for r in regime_fracs]),
+        1e-6,
+    )
+
+    # ── Step 4: Current regime from recent trades ─────────────────────
+    last_n = min(window, n_trades)
+    current_regime = int(np.std(fracs[-last_n:]) >= vol_threshold)
+
+    # ── Step 5: Simulate paths ────────────────────────────────────────
+    rng = np.random.default_rng(seed=42)
+    final_returns = np.zeros(n_simulations)
+    max_drawdowns = np.zeros(n_simulations)
+    n_store = min(100, n_simulations)
+    path_equities: List[List[float]] = []
+
+    for sim_i in range(n_simulations):
+        regime = current_regime
+        equity = float(initial_capital)
+        peak = equity
+        worst_dd = 0.0
+        store = sim_i < n_store
+        path: Optional[List[float]] = [equity] if store else None
+
+        for _ in range(n_trades):
+            ret = float(rng.normal(regime_mean[regime], regime_std[regime]))
+            equity = equity * (1.0 + ret)
+            if equity <= 0.0:
+                equity = 0.0
+                worst_dd = 1.0
+                if path is not None:
+                    path.append(equity)
+                break
+            if equity > peak:
+                peak = equity
+            dd = (peak - equity) / peak
+            if dd > worst_dd:
+                worst_dd = dd
+            if path is not None:
+                path.append(equity)
+            # Markov transition to next regime
+            regime = int(rng.choice(2, p=T[regime]))
+
+        final_returns[sim_i] = (equity - initial_capital) / initial_capital
+        max_drawdowns[sim_i] = worst_dd
+        if store and path is not None:
+            path_equities.append(path)
+
+    return {
+        "median_return":     float(np.median(final_returns)),
+        "mean_return":       float(np.mean(final_returns)),
+        "p5_return":         float(np.percentile(final_returns, 5)),
+        "p25_return":        float(np.percentile(final_returns, 25)),
+        "p75_return":        float(np.percentile(final_returns, 75)),
+        "p95_return":        float(np.percentile(final_returns, 95)),
+        "p5_drawdown":       float(np.percentile(max_drawdowns, 5)),
+        "median_drawdown":   float(np.median(max_drawdowns)),
+        "p95_drawdown":      float(np.percentile(max_drawdowns, 95)),
+        "prob_profitable":   float((final_returns > 0).mean()),
+        "prob_ruin":         float((final_returns < -0.50).mean()),
+        "n_simulations":     n_simulations,
+        "n_trades":          n_trades,
+        "all_returns":       final_returns,
+        "all_drawdowns":     max_drawdowns,
+        # Markov-specific
+        "regime_names":      ["Calm", "Stressed"],
+        "regime_labels":     regimes.tolist(),
+        "transition_matrix": T.tolist(),
+        "regime_mean":       regime_mean.tolist(),
+        "regime_std":        regime_std.tolist(),
+        "current_regime":    current_regime,
+        "vol_threshold":     float(vol_threshold),
+        "path_equities":     path_equities,
+        "initial_capital":   initial_capital,
+    }
+
+
+def sharpe_significance(
+    per_trade_returns: np.ndarray,
+    n_bootstrap: int = 1000,
+    trades_per_year: int = 200,
+) -> Dict:
+    """Bootstrap CI on annualised Sharpe + t-test significance.
+
+    Args:
+        per_trade_returns: Array of per-trade returns as fraction of capital
+                           (e.g. net_pnl / initial_capital)
+        n_bootstrap: Number of bootstrap resamples (default 1000)
+        trades_per_year: Estimate for annualisation (default 200)
+
+    Returns dict with keys:
+        sharpe          — observed annualised Sharpe
+        ci_low_5pct     — 5th percentile of bootstrap distribution
+        ci_high_95pct   — 95th percentile of bootstrap distribution
+        t_stat          — t-statistic (H0: mean return = 0)
+        p_value         — two-tailed p-value
+        is_significant  — True if p < 0.05 AND ci_low > 0
+        n_trades        — number of trades used
+    """
+    from scipy import stats as _stats
+
+    _EMPTY = {
+        "sharpe": 0.0, "ci_low_5pct": 0.0, "ci_high_95pct": 0.0,
+        "t_stat": 0.0, "p_value": 1.0, "is_significant": False,
+        "n_trades": len(per_trade_returns), "trades_per_year": trades_per_year,
+    }
+
+    n = len(per_trade_returns)
+    if n < 5:
+        return _EMPTY
+
+    mu = float(np.mean(per_trade_returns))
+    sigma = float(np.std(per_trade_returns, ddof=1))
+
+    if sigma < 1e-10:
+        return _EMPTY
+
+    # Observed annualised Sharpe
+    observed_sharpe = mu / sigma * np.sqrt(trades_per_year)
+
+    # Bootstrap 1000×: resample with replacement, compute Sharpe each time
+    rng = np.random.default_rng(seed=42)
+    boot_sharpes = np.zeros(n_bootstrap)
+    for i in range(n_bootstrap):
+        sample = rng.choice(per_trade_returns, size=n, replace=True)
+        s_mu = float(np.mean(sample))
+        s_sigma = float(np.std(sample, ddof=1))
+        boot_sharpes[i] = (s_mu / s_sigma * np.sqrt(trades_per_year)) if s_sigma > 1e-10 else 0.0
+
+    ci_low = float(np.percentile(boot_sharpes, 5))
+    ci_high = float(np.percentile(boot_sharpes, 95))
+
+    # t-test: H0: mean return = 0
+    t_stat = float(mu / (sigma / np.sqrt(n)))
+    p_value = float(2 * _stats.t.sf(abs(t_stat), df=n - 1))
+
+    is_significant = p_value < 0.05 and ci_low > 0
+
+    return {
+        "sharpe": round(observed_sharpe, 3),
+        "ci_low_5pct": round(ci_low, 3),
+        "ci_high_95pct": round(ci_high, 3),
+        "t_stat": round(t_stat, 3),
+        "p_value": round(p_value, 4),
+        "is_significant": bool(is_significant),
+        "n_trades": n,
+        "trades_per_year": trades_per_year,
+        "boot_sharpes": boot_sharpes.tolist(),
+    }
+
+
 def run_validation(
     config: dict,
     strategy_name: str,
@@ -505,13 +722,16 @@ def run_validation(
     if not oos_paired.empty and "net_pnl" in oos_paired.columns:
         all_pnls.extend(oos_paired["net_pnl"].tolist())
 
+    initial_cap = config.get("backtest", {}).get("initial_capital", 10_000)
+
     if not all_pnls:
         print("\n  No trades to simulate. Strategy generated 0 round-trips.")
         mc_result = monte_carlo(np.array([]), mc_simulations)
+        mc_markov = markov_monte_carlo(np.array([]), mc_simulations, initial_cap)
     else:
         trade_pnls = np.array(all_pnls)
-        initial_cap = config.get("backtest", {}).get("initial_capital", 10_000)
         mc_result = monte_carlo(trade_pnls, mc_simulations, initial_cap)
+        mc_markov = markov_monte_carlo(trade_pnls, mc_simulations, initial_cap)
 
         n_trades = mc_result["n_trades"]
         print(f"\n  Trades bootstrapped: {n_trades}")
@@ -539,6 +759,90 @@ def run_validation(
             print(f"  ~ Strategy is marginally profitable — coin flip")
         else:
             print(f"  ✗ Strategy loses money in majority of scenarios")
+
+    # ============================================================
+    #  STEP 4b: Markov-Chain Monte Carlo
+    # ============================================================
+    print(f"\n{'─'*65}")
+    print(f"  MARKOV-CHAIN MC — Regime-Switching Risk Model")
+    print(f"{'─'*65}")
+
+    if mc_markov.get("transition_matrix") is not None:
+        reg   = mc_markov["regime_names"]
+        T     = mc_markov["transition_matrix"]
+        cur   = mc_markov["current_regime"]
+        rlabs = mc_markov["regime_labels"]
+        n_c   = sum(1 for r in rlabs if r == 0)
+        n_s   = sum(1 for r in rlabs if r == 1)
+        total_r = max(n_c + n_s, 1)
+
+        print(f"\n  Regime breakdown ({total_r} trades):")
+        print(f"    Calm     : {n_c:>4} trades ({n_c/total_r:>5.1%})")
+        print(f"    Stressed : {n_s:>4} trades ({n_s/total_r:>5.1%})")
+        print(f"\n  Transition matrix:")
+        print(f"    Calm → Calm:         {T[0][0]:.2f}   Calm → Stressed:     {T[0][1]:.2f}")
+        print(f"    Stressed → Calm:     {T[1][0]:.2f}   Stressed → Stressed: {T[1][1]:.2f}")
+        print(f"\n  Current regime: {reg[cur]}")
+        print(f"\n  Conditional drawdown (regime-aware):")
+        std_p95 = mc_result.get("p95_drawdown", 0) if all_pnls else 0
+        mkv_p95 = mc_markov["p95_drawdown"]
+        print(f"    Standard MC P95 DD:    {std_p95:>7.2%}  (assumes stationary risk)")
+        print(f"    Markov-Chain MC P95 DD:{mkv_p95:>7.2%}  (conditional on {reg[cur]} regime)")
+        if mkv_p95 > std_p95 * 1.15:
+            print(f"  ⚠ Regime model shows ELEVATED tail risk — size positions accordingly")
+        elif mkv_p95 < std_p95 * 0.85:
+            print(f"  ✓ Regime model shows LOWER conditional risk — regime is favourable")
+        else:
+            print(f"  ~ Regime and standard MC agree — risk estimate is stable")
+        if T[1][1] > 0.70:
+            print(f"  ⚠ High Stressed persistence (T={T[1][1]:.2f}) — drawdowns tend to cluster")
+    else:
+        print(f"\n  Not enough trades for regime analysis (need ≥6).")
+
+    # ============================================================
+    #  STEP 4c: Sharpe Confidence Interval
+    # ============================================================
+    print(f"\n{'─'*65}")
+    print(f"  SHARPE CONFIDENCE INTERVAL (bootstrap, n=1000)")
+    print(f"{'─'*65}")
+
+    sig_result: Dict = {}
+    if all_pnls:
+        # Per-trade returns as fraction of initial capital
+        oos_rets = np.array([])
+        if not oos_paired.empty and "net_pnl" in oos_paired.columns:
+            oos_rets = oos_paired["net_pnl"].values / initial_cap
+
+        # Use all trades for bootstrap (more stable CI), OOS for primary Sharpe
+        all_rets = np.array(all_pnls) / initial_cap
+
+        # Estimate trades_per_year from total date range
+        try:
+            from datetime import datetime as _dt
+            days = (_dt.strptime(end, "%Y-%m-%d") - _dt.strptime(start, "%Y-%m-%d")).days
+            tpy = max(10, int(len(all_pnls) / max(1, days / 252)))
+        except Exception:
+            tpy = 200
+
+        sig_result = sharpe_significance(all_rets, n_bootstrap=1000, trades_per_year=tpy)
+
+        sharpe_sym = "+" if sig_result["sharpe"] >= 0 else ""
+        ci_lo_sym  = "+" if sig_result["ci_low_5pct"] >= 0 else ""
+        ci_hi_sym  = "+" if sig_result["ci_high_95pct"] >= 0 else ""
+        print(f"\n  Annualised Sharpe : {sharpe_sym}{sig_result['sharpe']:.3f}")
+        print(f"  95% CI            : [{ci_lo_sym}{sig_result['ci_low_5pct']:.3f}  to  "
+              f"{ci_hi_sym}{sig_result['ci_high_95pct']:.3f}]")
+        print(f"  t-stat / p-value  : t={sig_result['t_stat']:.2f},  p={sig_result['p_value']:.4f}")
+        print(f"  Trades used       : {sig_result['n_trades']}  (~{tpy}/yr assumed)")
+
+        if sig_result["is_significant"]:
+            print(f"  ✓ Edge is statistically significant (p < 0.05, CI lower bound > 0)")
+        elif sig_result["p_value"] < 0.10:
+            print(f"  ~ Marginal significance (p < 0.10) — more trades needed for confidence")
+        else:
+            print(f"  ✗ Edge NOT statistically significant at 5% level")
+    else:
+        print(f"\n  No trades — cannot compute Sharpe CI.")
 
     # ============================================================
     #  FINAL VERDICT
@@ -607,6 +911,8 @@ def run_validation(
         "walk_forward": wf_results,
         "out_of_sample": oos_result,
         "monte_carlo": mc_result,
+        "markov_mc": mc_markov,
+        "sharpe_significance": sig_result,
         "score": score,
         "checks": checks,
     }
