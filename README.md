@@ -96,7 +96,7 @@ broker:
   host: "127.0.0.1"
   port: 7497          # TWS paper: 7497 | IB Gateway paper: 4002
   client_id: 1
-  account: "DU1234567"   # your paper account ID
+  account: " "   # your paper account ID
 
 backtest:
   initial_capital: 10000.0
