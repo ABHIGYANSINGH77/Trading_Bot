@@ -1,273 +1,235 @@
-"""Event-Driven Intraday Strategy.
+"""Event-Driven Intraday Strategy v10 — Research-Validated.
 
-instead of scanning every bar with indicators, we WAIT for specific market events, then CONTEXTUALIZE and SCORE them.
+Three strategies validated through independent Phase 0→4 research pipeline
+(Jan 2024 – Dec 2025, 5 large-cap equities at 15-min bars):
 
-Events (the TRIGGER — rare, structural):
-  1. Opening Range Breakout/Failure (ORB)
-  2. Prior Session High/Low Sweep + Rejection
+  SWEEP_HQ          NVDA PDL liquidity sweep + gap-up day + prior-up
+                    OOS Sharpe +0.933, 4/4 WF pass, n≈50 OOS trades/yr
+                    Filters: NVDA + prior_up + gap_pos + not_friday + avoid_13_14h
+                    Entry : sweep-bar close (M1) | Stop: sweep wick
+                    Exit  : Fixed +1R target
 
-Context Features (the FILTER — repurposed indicators):
-  - MA alignment, RSI, VWAP position, volume ratio
-  - ATR percentile, time of day, gap direction
-  - These DON'T generate signals. They score events.
+  ORBFAIL_REGIME    Failed SHORT ORB breakout on gap-up days, above VWAP
+                    OOS Sharpe +0.704, 4/4 WF pass, n≈38 OOS trades/yr
+                    Filters: not_goog + gap_up(>+0.2%) + fail_above_vwap
+                    Entry : failure-bar close (M1) | Stop: min-low of BO move
+                    Exit  : 50%@1R → activate ATR trail on remainder; EOD fallback
 
-Usage:
-    python main.py backtest -s event_driven -i 15m -d ibkr --start 2025-06-01 --end 2025-12-01
+  SWEEP_PRIMARY     All-symbol PDL sweep, midweek, near intraday extreme
+                    OOS Sharpe ~+0.29, 2/4 WF pass — MARGINAL (half position)
+                    Filters: LONG + prior_up + midweek(Tue/Wed/Thu) + near_extreme
+                    Entry : confirmation-bar close (M2) | Stop: sweep wick
+                    Exit  : EOD (hold all session)
+
+Vol-compression event: DROPPED — Phase 0 showed no edge (-0.007R, WR=18%).
+ORB-breakout momentum: not implemented — Phase 4 WF marginal, superseded by
+  ORBFAIL_REGIME which uses the same events more profitably via fade.
 """
 
 from collections import defaultdict
-from datetime import time, date, timedelta
-from typing import Dict, List, Optional, Any
+from datetime import time, date
+from typing import Dict, List, Optional
+
 import numpy as np
 
 from core.events import EventBus, EventType, MarketDataEvent, SignalEvent, SignalType
 from strategies import BaseStrategy
-from features import atr, rsi, ema, relative_volume
+from features import atr as _atr_arr
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SESSION STATE — tracks daily levels per symbol
+#  SESSION STATE — per-symbol, per-day intraday tracking
 # ═══════════════════════════════════════════════════════════════
 
 class SessionState:
-    """Tracks per-symbol, per-day session data."""
+    """Tracks all intraday levels and event flags needed by the three strategies."""
 
     def __init__(self):
         self.current_date: Optional[date] = None
 
-        # Prior day levels (set at start of new day)
+        # ── Prior day levels ──
         self.prior_day_high: float = 0.0
         self.prior_day_low: float = 0.0
-        self.prior_day_close: float = 0.0
-        self.prior_day_range: float = 0.0
+        self.prior_day_open: float = 0.0    # first bar open of prior day
+        self.prior_day_close: float = 0.0   # last bar close of prior day
+        self.prior_day_up: bool = False      # prior-day close >= open
 
-        # Today's session tracking
+        # ── Today's session ──
         self.today_bars: List[dict] = []
+        self.today_open: float = 0.0
         self.today_high: float = 0.0
-        self.today_low: float = float('inf')
+        self.today_low: float = float("inf")
 
-        # Opening range (first N minutes)
+        # ── Gap ──
+        self.gap_pct: float = 0.0
+        self.gap_pos: bool = False   # today's open > prior close by > +0.2%
+
+        # ── Opening range (ORB = first 2 bars, first 30 min at 15-min resolution) ──
         self.orb_high: float = 0.0
         self.orb_low: float = 0.0
         self.orb_defined: bool = False
-        self.orb_volume: float = 0.0
         self.orb_bar_count: int = 0
 
-        # Event flags (fire once per day)
-        self.orb_breakout_fired: bool = False
-        self.orb_failure_fired: bool = False
-        self.pdh_sweep_fired: bool = False
-        self.pdl_sweep_fired: bool = False
+        # ── ORB breakout tracking (used by ORBFAIL_REGIME) ──
+        # Only SHORT_BO (close below ORB_LOW) → potential LONG fade is tracked.
+        self.orb_bo_detected: bool = False
+        self.orb_bo_direction: str = ""     # "SHORT_BO" only
+        self.orb_bo_extreme: float = 0.0    # running min-low from BO+1 bar onwards
+        self.orb_bo_bar_idx: int = 0        # bar index of BO detection (0-indexed)
+        self.orb_fail_fired: bool = False   # one failure signal per day
 
-        # Sweep tracking
-        self.pdh_sweep_detected: bool = False
-        self.pdh_sweep_bar_idx: int = 0
-        self.pdh_sweep_extreme: float = 0.0
-        self.pdh_sweep_confirmed: bool = False
-        self.pdl_sweep_detected: bool = False
-        self.pdl_sweep_bar_idx: int = 0
-        self.pdl_sweep_extreme: float = 0.0
-        self.pdl_sweep_confirmed: bool = False
-
-        # VWAP
-        self.vwap_cum_tp_vol: float = 0.0
-        self.vwap_cum_vol: float = 0.0
+        # ── Running VWAP (reset each session) ──
+        self.vwap_num: float = 0.0
+        self.vwap_den: float = 0.0
         self.current_vwap: float = 0.0
 
-        # Historical ORB widths for relative comparison
-        self.orb_history: List[float] = []
+        # ── PDL sweep tracking ──
+        self.pdl_sweep_fired: bool = False   # any PDL sweep signal fired today
+        # M2 confirmation state (SWEEP_PRIMARY)
+        self.pdl_sweep_pending: bool = False
+        self.pdl_sweep_bar_idx: int = 0      # bar index when sweep detected
+        self.pdl_sweep_extreme: float = 0.0  # sweep wick (absolute low at detection)
+        self.pdl_near_extreme: bool = False  # near_extreme flag saved at detection time
 
-    def new_day(self, prior_bars: List[dict]):
-        """Reset for new trading day. prior_bars = yesterday's bars."""
+    def new_day(self, prior_bars: List[dict]) -> None:
+        """Reset for a new trading day, seeding prior-day levels from yesterday's bars."""
         if prior_bars:
-            highs = [b["high"] for b in prior_bars]
-            lows = [b["low"] for b in prior_bars]
-            self.prior_day_high = max(highs)
-            self.prior_day_low = min(lows)
+            self.prior_day_high = max(b["high"] for b in prior_bars)
+            self.prior_day_low = min(b["low"] for b in prior_bars)
+            self.prior_day_open = prior_bars[0]["open"]
             self.prior_day_close = prior_bars[-1]["close"]
-            self.prior_day_range = self.prior_day_high - self.prior_day_low
-
-            # Store ORB if it was defined
-            if self.orb_defined:
-                self.orb_history.append(self.orb_high - self.orb_low)
-                if len(self.orb_history) > 20:
-                    self.orb_history.pop(0)
+            self.prior_day_up = self.prior_day_close >= self.prior_day_open
 
         self.today_bars = []
+        self.today_open = 0.0
         self.today_high = 0.0
-        self.today_low = float('inf')
+        self.today_low = float("inf")
+        self.gap_pct = 0.0
+        self.gap_pos = False
         self.orb_high = 0.0
         self.orb_low = 0.0
         self.orb_defined = False
-        self.orb_volume = 0.0
         self.orb_bar_count = 0
-        self.orb_breakout_fired = False
-        self.orb_failure_fired = False
-        self.pdh_sweep_fired = False
+        self.orb_bo_detected = False
+        self.orb_bo_direction = ""
+        self.orb_bo_extreme = 0.0
+        self.orb_bo_bar_idx = 0
+        self.orb_fail_fired = False
+        self.vwap_num = 0.0
+        self.vwap_den = 0.0
+        self.current_vwap = 0.0
         self.pdl_sweep_fired = False
-        self.pdh_sweep_detected = False
-        self.pdl_sweep_detected = False
-        self.vwap_cum_tp_vol = 0.0
-        self.vwap_cum_vol = 0.0
+        self.pdl_sweep_pending = False
+        self.pdl_sweep_bar_idx = 0
+        self.pdl_sweep_extreme = 0.0
+        self.pdl_near_extreme = False
 
-    def update_bar(self, bar: dict):
-        """Update session state with new bar."""
+    def update_bar(self, bar: dict) -> None:
+        """Update session state with the incoming bar (call before signal logic)."""
         self.today_bars.append(bar)
         self.today_high = max(self.today_high, bar["high"])
         self.today_low = min(self.today_low, bar["low"])
 
-        # Update VWAP
+        # Gap is computed once on the first bar of the day
+        if len(self.today_bars) == 1:
+            self.today_open = bar["open"]
+            if self.prior_day_close > 0:
+                self.gap_pct = (bar["open"] - self.prior_day_close) / self.prior_day_close
+                self.gap_pos = self.gap_pct > 0.002   # > +0.2%
+
+        # Running VWAP (session-cumulative, no look-ahead)
         tp = (bar["high"] + bar["low"] + bar["close"]) / 3.0
-        self.vwap_cum_tp_vol += tp * bar["volume"]
-        self.vwap_cum_vol += bar["volume"]
-        if self.vwap_cum_vol > 0:
-            self.current_vwap = self.vwap_cum_tp_vol / self.vwap_cum_vol
-
-        # ── Track sweep state (always, even during position) ──
-        # Phase 1: detect wick through PDH/PDL
-        price = bar["close"]
-        bar_idx = len(self.today_bars) - 1
-
-        if self.prior_day_high > 0:
-            # PDH sweep: wick above PDH, close below
-            if (not self.pdh_sweep_detected and not self.pdh_sweep_fired
-                    and bar["high"] > self.prior_day_high
-                    and price <= self.prior_day_high):
-                self.pdh_sweep_detected = True
-                self.pdh_sweep_bar_idx = bar_idx
-                self.pdh_sweep_extreme = bar["high"]
-
-            # PDL sweep: wick below PDL, close above
-            if (not self.pdl_sweep_detected and not self.pdl_sweep_fired
-                    and bar["low"] < self.prior_day_low
-                    and price >= self.prior_day_low):
-                self.pdl_sweep_detected = True
-                self.pdl_sweep_bar_idx = bar_idx
-                self.pdl_sweep_extreme = bar["low"]
-
-            # Phase 2: Check sweep rejection confirmation
-            rejection_bars = 2  # default, overridden from strategy params later
-            if self.pdh_sweep_detected:
-                bars_since = bar_idx - self.pdh_sweep_bar_idx
-                if bars_since > rejection_bars:
-                    self.pdh_sweep_detected = False
-                elif bars_since >= 1:
-                    if (bar["high"] < self.pdh_sweep_extreme
-                            and price < self.prior_day_high
-                            and price < bar["open"]):
-                        self.pdh_sweep_confirmed = True
-
-            if self.pdl_sweep_detected:
-                bars_since = bar_idx - self.pdl_sweep_bar_idx
-                if bars_since > rejection_bars:
-                    self.pdl_sweep_detected = False
-                elif bars_since >= 1:
-                    if (bar["low"] > self.pdl_sweep_extreme
-                            and price > self.prior_day_low
-                            and price > bar["open"]):
-                        self.pdl_sweep_confirmed = True
+        vol = max(bar.get("volume", 0.0), 0.0)
+        if vol > 0:
+            self.vwap_num += tp * vol
+            self.vwap_den += vol
+            self.current_vwap = self.vwap_num / self.vwap_den
 
 
 # ═══════════════════════════════════════════════════════════════
-#  EVENT DEFINITIONS
-# ═══════════════════════════════════════════════════════════════
-
-class MarketEvent:
-    """Base class for detected market events."""
-    def __init__(self, name: str, direction: str, symbol: str,
-                 trigger_price: float, **kwargs):
-        self.name = name
-        self.direction = direction  # "LONG" or "SHORT"
-        self.symbol = symbol
-        self.trigger_price = trigger_price
-        self.features = kwargs  # event-specific features
-
-
-# ═══════════════════════════════════════════════════════════════
-#  THE STRATEGY
+#  STRATEGY
 # ═══════════════════════════════════════════════════════════════
 
 class EventDrivenStrategy(BaseStrategy):
-    """
-    Event-driven intraday strategy.
+    """Event-driven intraday strategy v10 — three research-validated setups.
 
-    On most bars: does NOTHING.
-    When an event fires: contextualizes → scores → trades if high confidence.
+    Architecture: Data → Session Update → Exit Check → Entry Detection
+    No scoring engine; each strategy uses hard binary filters validated
+    through the Phase 0→4 walk-forward pipeline.
     """
+
+    name = "event_driven"
+
+    # ── ORB failure parameters (from Phase 0 research) ──
+    _ORB_BO_MIN_BAR = 2    # earliest valid BO: bar index 2 (10:00 bar), 0-indexed
+    _ORB_BO_MAX_BAR = 7    # latest valid BO: bar index 7 (11:15 bar)
+    _ORB_FAIL_WINDOW = 6   # failure must occur within 6 bars of BO
+
+    # ── Sweep parameters ──
+    _SWEEP_CONF_WINDOW = 3  # bars available for M2 confirmation
+
+    # ── Time constants ──
+    _ORB_END_TIME = time(10, 0)     # ORB defined when bar_time >= 10:00
+    _ENTRY_CUTOFF = time(15, 15)    # no new entries after this
+    _EOD_TIME = time(15, 30)        # EOD exit trigger (SWEEP_PRIMARY + ORBFAIL fallback)
 
     def __init__(self, event_bus: EventBus, params: dict = None):
         default_params = {
-            "symbols": ["AAPL"],
-            # Opening range
-            "orb_minutes": 30,          # First 30 min = opening range
-            "orb_break_pct": 0.001,     # Close must exceed range by 0.1%
-            "orb_failure_bars": 3,      # Bars to confirm failure
-            # Session sweep
-            "sweep_rejection_bars": 2,  # Bars to confirm rejection
-            "sweep_min_overshoot_atr": 0.1,  # Min wick beyond level
-            # Scoring
-            "score_threshold": 6,       # Out of 10 — trade only >= this
-            # Trade management
-            "risk_atr_mult": 1.5,       # Stop = 1.5 ATR
-            "target_rr": 2.5,           # Target = 2.5× risk
-            "trail_trigger_rr": 1.5,    # Trail after 1.5× risk gained
-            "max_hold_bars": 20,        # Max 20 bars (5 hours on 15m)
-            "entry_cutoff": time(15, 0),  # No new entries after 3 PM
-            # Indicator periods (for context features)
-            "ma_fast": 20,
-            "ma_slow": 50,
-            "rsi_period": 14,
+            "symbols": ["AAPL", "NVDA", "MSFT", "AMZN", "GOOG"],
+            "min_bars": 30,
             "atr_period": 14,
-            "min_bars": 60,             # Warmup
         }
         merged = {**default_params, **(params or {})}
         super().__init__("event_driven", event_bus, merged)
 
-        # Per-symbol state
-        self._session: Dict[str, SessionState] = {}
-        self._in_position: Dict[str, str] = {}      # symbol -> "long"/"short"
-        self._entry_price: Dict[str, float] = {}
-        self._stop_price: Dict[str, float] = {}
-        self._target_price: Dict[str, float] = {}
-        self._entry_bar_idx: Dict[str, int] = {}
+        # Session state (one per symbol)
+        self._sessions: Dict[str, SessionState] = {}
         self._bar_count: Dict[str, int] = defaultdict(int)
-        self._entry_event: Dict[str, str] = {}      # symbol -> event name
 
-        # Diagnostics
-        self._events_detected = defaultdict(int)
-        self._events_scored = defaultdict(lambda: {"passed": 0, "failed": 0})
-        self._trades_by_event = defaultdict(lambda: {"count": 0, "wins": 0})
-        self._total_bars = 0
-        self._total_events = 0
+        # ── Open position state (one trade per symbol at a time) ──
+        self._in_position: Dict[str, str] = {}      # symbol → strategy name
+        self._pos_direction: Dict[str, str] = {}    # symbol → "long" | "short"
+        self._pos_entry: Dict[str, float] = {}
+        self._pos_stop: Dict[str, float] = {}
+        self._pos_risk: Dict[str, float] = {}       # initial risk distance
+        self._pos_target: Dict[str, float] = {}     # SWEEP_HQ fixed 1R target
+        self._pos_partial: Dict[str, bool] = {}     # ORBFAIL: has 1R been reached?
+        self._pos_best: Dict[str, float] = {}       # ORBFAIL: high-water for ATR trail
+
+        # ── Diagnostics ──
         self._total_trades = 0
-        self._score_distribution = defaultdict(int)
+        self._trades_by_strategy: Dict[str, Dict] = defaultdict(
+            lambda: {"count": 0, "wins": 0})
+        self._exit_reasons: Dict[str, int] = defaultdict(int)
+
+    # ───────────────────────────────────────────────────────────
+    #  SESSION ACCESSOR
+    # ───────────────────────────────────────────────────────────
 
     def _get_session(self, symbol: str) -> SessionState:
-        if symbol not in self._session:
-            self._session[symbol] = SessionState()
-        return self._session[symbol]
+        if symbol not in self._sessions:
+            self._sessions[symbol] = SessionState()
+        return self._sessions[symbol]
 
-    # ───────────────────────────────────────────────────────
-    #  MAIN SIGNAL LOOP — mostly does NOTHING
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
+    #  MAIN BAR LOOP
+    # ───────────────────────────────────────────────────────────
 
     def calculate_signal(self, symbol: str) -> Optional[SignalEvent]:
         if symbol not in self.params.get("symbols", []):
             return None
 
         bars = self._bar_history.get(symbol, [])
-        if not bars:
+        if not bars or len(bars) < self.params["min_bars"]:
             return None
 
-        self._total_bars += 1
         self._bar_count[symbol] += 1
         bar = bars[-1]
         bar_time = self._get_bar_time(bar)
         bar_date = self._get_bar_date(bar)
         session = self._get_session(symbol)
 
-        # ── New day? Reset session state ──
-        # MUST happen before warmup check so PDH/PDL get set
+        # ── New day: reset session, seed prior-day levels ──
         if bar_date and bar_date != session.current_date:
             prior_bars = [b for b in bars[:-1]
                           if self._get_bar_date(b) == session.current_date]
@@ -276,647 +238,597 @@ class EventDrivenStrategy(BaseStrategy):
 
         session.update_bar(bar)
 
-        # ── Build opening range even during warmup ──
-        if bar_time and not session.orb_defined:
-            orb_end = self._add_minutes(time(9, 30), self.params["orb_minutes"])
-            if bar_time < orb_end:
+        # ── Build ORB (first 2 bars = 9:30 and 9:45) ──
+        if not session.orb_defined and bar_time is not None:
+            if bar_time < self._ORB_END_TIME:
                 if session.orb_bar_count == 0:
                     session.orb_high = bar["high"]
                     session.orb_low = bar["low"]
                 else:
                     session.orb_high = max(session.orb_high, bar["high"])
                     session.orb_low = min(session.orb_low, bar["low"])
-                session.orb_volume += bar.get("volume", 0)
                 session.orb_bar_count += 1
-            elif bar_time >= orb_end:
+            else:
                 session.orb_defined = True
 
-        # ── Warmup: need enough bars for indicators ──
-        if len(bars) < self.params["min_bars"]:
-            return None
-
-        # ── Check exits first ──
+        # ── Exit check: always first, before any entry logic ──
         if symbol in self._in_position:
-            return self._check_exit(symbol, bars)
+            return self._check_exit(symbol, bar, bars, session, bar_time)
 
-        # ── No prior day data yet? Skip event detection ──
+        # ── Entry guards ──
         if session.prior_day_high == 0:
             return None
-
-        # ── Still building opening range? No events yet ──
-        if not session.orb_defined:
+        if bar_time is not None and bar_time >= self._ENTRY_CUTOFF:
             return None
 
-        # ── Entry cutoff ──
-        if bar_time and bar_time >= self.params["entry_cutoff"]:
+        # ── Update ORB breakout tracking (runs every bar after ORB defined) ──
+        if session.orb_defined and not session.orb_fail_fired:
+            self._update_orb_bo_tracking(bar, session)
+
+        # ── Strategy 1: SWEEP_HQ (NVDA only) ──
+        if symbol == "NVDA" and bar_time is not None:
+            sig = self._check_sweep_hq(symbol, bar, session, bar_time, bar_date)
+            if sig:
+                return sig
+
+        # ── Strategy 2: ORBFAIL_REGIME (all except GOOG) ──
+        if symbol != "GOOG" and session.orb_defined:
+            sig = self._check_orbfail_regime(symbol, bar, bars, session)
+            if sig:
+                return sig
+
+        # ── Strategy 3: SWEEP_PRIMARY (all symbols, LONG only) ──
+        sig = self._check_sweep_primary(symbol, bar, session, bar_date)
+        if sig:
+            return sig
+
+        return None
+
+    # ───────────────────────────────────────────────────────────
+    #  ORB BREAKOUT TRACKING (for ORBFAIL_REGIME)
+    # ───────────────────────────────────────────────────────────
+
+    def _update_orb_bo_tracking(self, bar: dict, session: SessionState) -> None:
+        """Detect and track SHORT_BO (close below ORB low) in the valid window.
+
+        The running extreme (min low) is accumulated from the bar AFTER detection
+        through the failure bar, matching the research's stop_fn calculation.
+        """
+        bar_idx = len(session.today_bars) - 1
+
+        if not session.orb_bo_detected:
+            # Only detect within the validated window (bar indices 2-7)
+            if self._ORB_BO_MIN_BAR <= bar_idx <= self._ORB_BO_MAX_BAR:
+                if bar["close"] < session.orb_low:
+                    session.orb_bo_detected = True
+                    session.orb_bo_direction = "SHORT_BO"
+                    session.orb_bo_extreme = float("inf")  # updated from next bar
+                    session.orb_bo_bar_idx = bar_idx
+        else:
+            # Accumulate running min-low from bars AFTER the BO bar
+            if bar_idx > session.orb_bo_bar_idx:
+                session.orb_bo_extreme = min(session.orb_bo_extreme, bar["low"])
+
+    # ───────────────────────────────────────────────────────────
+    #  STRATEGY 1: SWEEP_HQ
+    # ───────────────────────────────────────────────────────────
+
+    def _check_sweep_hq(self, symbol: str, bar: dict, session: SessionState,
+                         bar_time: time, bar_date: Optional[date]) -> Optional[SignalEvent]:
+        """SWEEP_HQ — NVDA PDL sweep, M1 entry, Fixed +1R target.
+
+        Research result: 4/4 WF pass, OOS Sharpe +0.933, CI [+0.437R, +0.867R]
+        Entry on the sweep bar itself (M1 = sweep-bar close, no waiting for confirmation).
+        """
+        if session.pdl_sweep_fired or session.prior_day_low == 0:
             return None
 
-        # ═══════════════════════════════════════════════════
-        #  EVENT DETECTION — the heart of the system
-        #  Each detector returns a MarketEvent or None.
-        #  On most bars, ALL return None. That's correct.
-        # ═══════════════════════════════════════════════════
-
-        event = None
-
-        # Priority 1: ORB Breakout
-        if event is None:
-            event = self._detect_orb_breakout(symbol, bar, bars, session)
-
-        # Priority 2: ORB Failure (reverse)
-        if event is None:
-            event = self._detect_orb_failure(symbol, bar, bars, session)
-
-        # Priority 3: Session High/Low Sweep + Rejection
-        if event is None:
-            event = self._detect_session_sweep(symbol, bar, bars, session)
-
-        # ── No event? Do nothing. This is most bars. ──
-        if event is None:
+        # Validated time/day filters (from Phase 3 regime scan)
+        if bar_time.hour in (13, 14):
+            return None
+        if bar_date is not None and bar_date.weekday() == 4:   # Friday
             return None
 
-        # ═══════════════════════════════════════════════════
-        #  EVENT FIRED — Now contextualize and score
-        # ═══════════════════════════════════════════════════
-
-        self._total_events += 1
-        self._events_detected[event.name] += 1
-
-        context = self._build_context(event, bar, bars, session)
-        score = self._score_event(event, context)
-        self._score_distribution[score] += 1
-
-        if score < self.params["score_threshold"]:
-            self._events_scored[event.name]["failed"] += 1
-            return None  # Event fired but context doesn't support it
-
-        self._events_scored[event.name]["passed"] += 1
-
-        # ═══════════════════════════════════════════════════
-        #  HIGH-CONFIDENCE EVENT — Enter the trade
-        # ═══════════════════════════════════════════════════
-
-        self._total_trades += 1
-        self._trades_by_event[event.name]["count"] += 1
-
-        # Compute ATR for stop/target
-        high_arr = np.array([b["high"] for b in bars])
-        low_arr = np.array([b["low"] for b in bars])
-        close_arr = np.array([b["close"] for b in bars])
-        atr_val = atr(high_arr, low_arr, close_arr, self.params["atr_period"])[-1]
-        if np.isnan(atr_val) or atr_val <= 0:
+        # Validated day-regime filters
+        if not session.prior_day_up:
+            return None
+        if not session.gap_pos:
             return None
 
         price = bar["close"]
-        stop_dist = self.params["risk_atr_mult"] * atr_val
-        target_dist = stop_dist * self.params["target_rr"]
 
-        if event.direction == "LONG":
-            stop = price - stop_dist
-            target = price + target_dist
-            signal_type = SignalType.LONG
-        else:
-            stop = price + stop_dist
-            target = price - target_dist
-            signal_type = SignalType.SHORT
+        # PDL sweep: bar wicks below PDL AND closes back inside (>= PDL)
+        if bar["low"] < session.prior_day_low and price >= session.prior_day_low:
+            stop = bar["low"]               # sweep wick extreme
+            risk = abs(price - stop)
+            if risk <= 0:
+                return None
+            target = price + risk           # Fixed +1R
 
-        # Record position state
-        direction = "long" if event.direction == "LONG" else "short"
-        self._in_position[symbol] = direction
-        self._entry_price[symbol] = price
-        self._stop_price[symbol] = stop
-        self._target_price[symbol] = target
-        self._entry_bar_idx[symbol] = self._bar_count[symbol]
-        self._entry_event[symbol] = event.name
+            session.pdl_sweep_fired = True
+            self._enter_position(symbol, "sweep_hq", "long", price, stop, risk,
+                                  target=target)
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.LONG,
+                strength=1.0, strategy_name=self.name,
+                metadata={
+                    "strategy": "sweep_hq",
+                    "entry": round(price, 2),
+                    "stop": round(stop, 2),
+                    "target": round(target, 2),
+                    "risk": round(risk, 2),
+                    "position_scale": 1.0,
+                },
+            )
+        return None
 
+    # ───────────────────────────────────────────────────────────
+    #  STRATEGY 2: ORBFAIL_REGIME
+    # ───────────────────────────────────────────────────────────
+
+    def _check_orbfail_regime(self, symbol: str, bar: dict, bars: list,
+                               session: SessionState) -> Optional[SignalEvent]:
+        """ORBFAIL_REGIME — failed SHORT ORB on gap-up day above VWAP, M1 entry.
+
+        Research result: 4/4 WF pass, OOS Sharpe +0.704, CI [+0.224R, +0.504R]
+        Fades a SHORT ORB breakout that fails (bullish reversal bar above ORB mid)
+        when gap_up and price still above VWAP → trapped shorts fuel the move.
+        """
+        if session.orb_fail_fired:
+            return None
+        if not session.orb_bo_detected or session.orb_bo_direction != "SHORT_BO":
+            return None
+
+        # Check failure window (1 to FAIL_WINDOW bars after BO detection)
+        bar_idx = len(session.today_bars) - 1
+        bars_since_bo = bar_idx - session.orb_bo_bar_idx
+        if bars_since_bo < 1 or bars_since_bo > self._ORB_FAIL_WINDOW:
+            return None
+
+        # Day-regime filter: gap-up day only
+        if not session.gap_pos:
+            return None
+
+        price = bar["close"]
+        orb_mid = (session.orb_high + session.orb_low) / 2.0
+
+        # Failure conditions: bullish reversal bar (close > open) above ORB midpoint
+        if not (price > bar["open"] and price > orb_mid):
+            return None
+
+        # fail_above_vwap: price still above VWAP at failure bar
+        # (elevated price despite BO failure → strong reversal signal)
+        if session.current_vwap > 0 and price <= session.current_vwap:
+            return None
+
+        # Stop = min low of [BO+1 bar .. failure bar] (running extreme accumulated)
+        stop = session.orb_bo_extreme
+        if stop == float("inf"):
+            stop = bar["low"]   # edge case: no bars between BO and failure
+        risk = abs(price - stop)
+        if risk <= 0:
+            return None
+
+        session.orb_fail_fired = True
+        self._enter_position(symbol, "orbfail_regime", "long", price, stop, risk,
+                              best_price=price)
         return SignalEvent(
-            symbol=symbol,
-            signal_type=signal_type,
-            strength=min(score / 10.0, 1.0),
-            strategy_name=self.name,
+            symbol=symbol, signal_type=SignalType.LONG,
+            strength=1.0, strategy_name=self.name,
             metadata={
+                "strategy": "orbfail_regime",
                 "entry": round(price, 2),
                 "stop": round(stop, 2),
-                "target": round(target, 2),
-                "event": event.name,
-                "direction": event.direction,
-                "score": score,
-                "context": {k: round(v, 4) if isinstance(v, float) else v
-                            for k, v in context.items()},
+                "risk": round(risk, 2),
+                "orb_mid": round(orb_mid, 2),
+                "vwap": round(session.current_vwap, 2),
+                "position_scale": 1.0,
             },
         )
 
-    # ───────────────────────────────────────────────────────
-    #  EVENT DETECTOR 1: Opening Range Breakout
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
+    #  STRATEGY 3: SWEEP_PRIMARY
+    # ───────────────────────────────────────────────────────────
 
-    def _detect_orb_breakout(self, symbol, bar, bars, session) -> Optional[MarketEvent]:
+    def _check_sweep_primary(self, symbol: str, bar: dict, session: SessionState,
+                              bar_date: Optional[date]) -> Optional[SignalEvent]:
+        """SWEEP_PRIMARY — all-symbol PDL sweep, M2 confirmation entry.
+
+        Research result: 2/4 WF pass (MARGINAL) — half position size.
+        Waits for a bullish confirmation bar (close > open) within 3 bars
+        of the PDL sweep. All regime filters applied at confirmation time.
         """
-        Event: Price closes beyond the opening range after it's defined.
-
-        Why this works:
-        - The first 30 min captures overnight order flow resolution
-        - A breakout means one side has won the opening battle
-        - Well-documented edge: Crabel (1990s), still used by institutions
-
-        Frequency: 0-1 per day per symbol (perfect sweet spot)
-        """
-        if not session.orb_defined or session.orb_breakout_fired:
+        if session.prior_day_low == 0:
             return None
 
-        price = bar["close"]
-        orb_range = session.orb_high - session.orb_low
-        if orb_range <= 0:
-            return None
-
-        min_break = orb_range * self.params["orb_break_pct"]
-
-        # LONG breakout: close above ORB high
-        if price > session.orb_high + min_break:
-            session.orb_breakout_fired = True
-            return MarketEvent(
-                name="orb_breakout",
-                direction="LONG",
-                symbol=symbol,
-                trigger_price=price,
-                orb_high=session.orb_high,
-                orb_low=session.orb_low,
-                orb_range=orb_range,
-                orb_volume=session.orb_volume,
-            )
-
-        # SHORT breakout: close below ORB low
-        if price < session.orb_low - min_break:
-            session.orb_breakout_fired = True
-            return MarketEvent(
-                name="orb_breakout",
-                direction="SHORT",
-                symbol=symbol,
-                trigger_price=price,
-                orb_high=session.orb_high,
-                orb_low=session.orb_low,
-                orb_range=orb_range,
-                orb_volume=session.orb_volume,
-            )
-
-        return None
-
-    # ───────────────────────────────────────────────────────
-    #  EVENT DETECTOR 2: Opening Range Failure
-    # ───────────────────────────────────────────────────────
-
-    def _detect_orb_failure(self, symbol, bar, bars, session) -> Optional[MarketEvent]:
-        """
-        Event: Price breaks ORB, then reverses back inside within N bars.
-
-        Why this works:
-        - Traders who entered the breakout are now TRAPPED
-        - Their stop-loss exits accelerate the reversal
-        - Failed breakouts are often stronger than breakouts themselves
-
-        Frequency: ~2-3 per week per symbol
-        """
-        if not session.orb_defined or session.orb_failure_fired:
-            return None
-        if not session.orb_breakout_fired:
-            return None  # Need a breakout first to have a failure
-
-        price = bar["close"]
-        orb_mid = (session.orb_high + session.orb_low) / 2
-
-        # Get recent bars since ORB was defined
-        recent = session.today_bars[-self.params["orb_failure_bars"]:]
-        if len(recent) < self.params["orb_failure_bars"]:
-            return None
-
-        # Check if any recent bar broke above then current close is inside
-        broke_high = any(b["high"] > session.orb_high for b in recent[:-1])
-        broke_low = any(b["low"] < session.orb_low for b in recent[:-1])
-
-        # Failed upside breakout: broke above but now closing below ORB mid
-        if broke_high and price < orb_mid:
-            session.orb_failure_fired = True
-            return MarketEvent(
-                name="orb_failure",
-                direction="SHORT",  # Fade the failed breakout
-                symbol=symbol,
-                trigger_price=price,
-                orb_high=session.orb_high,
-                orb_low=session.orb_low,
-                orb_range=session.orb_high - session.orb_low,
-                failed_direction="long",
-            )
-
-        # Failed downside breakout: broke below but now closing above ORB mid
-        if broke_low and price > orb_mid:
-            session.orb_failure_fired = True
-            return MarketEvent(
-                name="orb_failure",
-                direction="LONG",  # Fade the failed breakout
-                symbol=symbol,
-                trigger_price=price,
-                orb_high=session.orb_high,
-                orb_low=session.orb_low,
-                orb_range=session.orb_high - session.orb_low,
-                failed_direction="short",
-            )
-
-        return None
-
-    # ───────────────────────────────────────────────────────
-    #  EVENT DETECTOR 3: Session Level Sweep + Rejection
-    # ───────────────────────────────────────────────────────
-
-    def _detect_session_sweep(self, symbol, bar, bars, session) -> Optional[MarketEvent]:
-        """
-        Event: Price sweeps prior day high/low (takes liquidity) then rejects.
-
-        Why this works:
-        - Stops cluster above PDH and below PDL
-        - Institutions push price to trigger those stops (liquidity grab)
-        - Once stops are hit, institutions fill large orders and price reverses
-        - This is directly from market microstructure theory
-
-        Sweep tracking happens in SessionState.update_bar() so it works
-        even when we're in a position from another trade.
-
-        Frequency: 2-5 per week per symbol (perfect sweet spot)
-        """
+        bar_idx = len(session.today_bars) - 1
         price = bar["close"]
 
-        # PDH sweep confirmed → SHORT
-        if session.pdh_sweep_confirmed and not session.pdh_sweep_fired:
-            session.pdh_sweep_confirmed = False
-            session.pdh_sweep_fired = True
-            session.pdh_sweep_detected = False
-            overshoot = session.pdh_sweep_extreme - session.prior_day_high
-            return MarketEvent(
-                name="session_sweep",
-                direction="SHORT",
-                symbol=symbol,
-                trigger_price=price,
-                level_swept=session.prior_day_high,
-                sweep_extreme=session.pdh_sweep_extreme,
-                overshoot=overshoot,
-                sweep_type="pdh",
-            )
+        # Phase 1: detect PDL sweep bar (set pending flag, do NOT fire yet)
+        if not session.pdl_sweep_pending and not session.pdl_sweep_fired:
+            if bar["low"] < session.prior_day_low and price >= session.prior_day_low:
+                session.pdl_sweep_pending = True
+                session.pdl_sweep_bar_idx = bar_idx
+                session.pdl_sweep_extreme = bar["low"]
+                # Compute near_extreme at detection time (uses today_bars up to this bar)
+                session.pdl_near_extreme = self._is_near_intraday_extreme(
+                    session, bar["low"])
+                return None   # Wait for confirmation bar
 
-        # PDL sweep confirmed → LONG
-        if session.pdl_sweep_confirmed and not session.pdl_sweep_fired:
-            session.pdl_sweep_confirmed = False
+        # Phase 2: check for M2 confirmation
+        if not session.pdl_sweep_pending:
+            return None
+
+        bars_since = bar_idx - session.pdl_sweep_bar_idx
+
+        # Expire if no confirmation within window
+        if bars_since > self._SWEEP_CONF_WINDOW:
+            session.pdl_sweep_pending = False
+            return None
+
+        if bars_since < 1:
+            return None   # Same bar as sweep detection — skip
+
+        # Apply validated regime filters at confirmation time
+        if not session.prior_day_up:
+            session.pdl_sweep_pending = False
+            return None
+
+        if bar_date is not None and bar_date.weekday() not in (1, 2, 3):  # not Tue/Wed/Thu
+            session.pdl_sweep_pending = False
+            return None
+
+        if not session.pdl_near_extreme:
+            session.pdl_sweep_pending = False
+            return None
+
+        # Confirmation: bullish bar (close > open)
+        if price > bar["open"]:
+            session.pdl_sweep_pending = False
             session.pdl_sweep_fired = True
-            session.pdl_sweep_detected = False
-            overshoot = session.prior_day_low - session.pdl_sweep_extreme
-            return MarketEvent(
-                name="session_sweep",
-                direction="LONG",
-                symbol=symbol,
-                trigger_price=price,
-                level_swept=session.prior_day_low,
-                sweep_extreme=session.pdl_sweep_extreme,
-                overshoot=overshoot,
-                sweep_type="pdl",
+            stop = session.pdl_sweep_extreme
+            risk = abs(price - stop)
+            if risk <= 0:
+                return None
+
+            self._enter_position(symbol, "sweep_primary", "long", price, stop, risk)
+            return SignalEvent(
+                symbol=symbol, signal_type=SignalType.LONG,
+                strength=0.5,   # Half position — 2/4 WF pass (marginal)
+                strategy_name=self.name,
+                metadata={
+                    "strategy": "sweep_primary",
+                    "entry": round(price, 2),
+                    "stop": round(stop, 2),
+                    "risk": round(risk, 2),
+                    "exit": "eod",
+                    "position_scale": 0.5,
+                },
             )
 
         return None
 
-    # ───────────────────────────────────────────────────────
-    #  CONTEXT BUILDER — repurposes existing indicators
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
+    #  POSITION MANAGEMENT
+    # ───────────────────────────────────────────────────────────
 
-    def _build_context(self, event: MarketEvent, bar: dict,
-                       bars: list, session: SessionState) -> Dict[str, Any]:
-        """
-        Gather contextualizing features around the event.
-        These are what your friend calls "better interpretation."
-        Our existing indicators become features, not signals.
-        """
-        close_arr = np.array([b["close"] for b in bars])
-        high_arr = np.array([b["high"] for b in bars])
-        low_arr = np.array([b["low"] for b in bars])
-        vol_arr = np.array([b.get("volume", 0) for b in bars], dtype=float)
+    def _enter_position(self, symbol: str, strategy: str, direction: str,
+                         entry: float, stop: float, risk: float,
+                         target: Optional[float] = None,
+                         best_price: Optional[float] = None) -> None:
+        self._in_position[symbol] = strategy
+        self._pos_direction[symbol] = direction
+        self._pos_entry[symbol] = entry
+        self._pos_stop[symbol] = stop
+        self._pos_risk[symbol] = risk
+        self._pos_partial[symbol] = False
+        self._pos_best[symbol] = best_price if best_price is not None else entry
 
-        price = bar["close"]
-        atr_val = atr(high_arr, low_arr, close_arr, self.params["atr_period"])[-1]
-        rsi_val = rsi(close_arr, self.params["rsi_period"])[-1]
-        rvol = relative_volume(vol_arr, 20)[-1]
-        ma_f = ema(close_arr, self.params["ma_fast"])[-1]
-        ma_s = ema(close_arr, self.params["ma_slow"])[-1]
-
-        is_long = event.direction == "LONG"
-        context = {}
-
-        # 1. MA alignment — trend agrees with event direction?
-        if not np.isnan(ma_f) and not np.isnan(ma_s):
-            ma_bull = ma_f > ma_s
-            context["ma_aligned"] = (is_long and ma_bull) or (not is_long and not ma_bull)
+        if target is not None:
+            self._pos_target[symbol] = target
         else:
-            context["ma_aligned"] = False
+            self._pos_target.pop(symbol, None)
 
-        # 2. RSI — not overextended in event direction?
-        if not np.isnan(rsi_val):
-            context["rsi"] = rsi_val
-            context["rsi_ok"] = (
-                (is_long and 30 < rsi_val < 70) or
-                (not is_long and 30 < rsi_val < 70)
-            )
-        else:
-            context["rsi"] = 50.0
-            context["rsi_ok"] = True
+        self._total_trades += 1
+        self._trades_by_strategy[strategy]["count"] += 1
 
-        # 3. VWAP position — institutional flow agrees?
-        context["above_vwap"] = price > session.current_vwap
-        context["vwap_aligned"] = (
-            (is_long and price > session.current_vwap) or
-            (not is_long and price < session.current_vwap)
-        )
+    def _clear_position(self, symbol: str) -> None:
+        for d in (self._in_position, self._pos_direction, self._pos_entry,
+                  self._pos_stop, self._pos_risk, self._pos_target,
+                  self._pos_partial, self._pos_best):
+            d.pop(symbol, None)
 
-        # 4. Volume confirmation — above average participation?
-        context["rvol"] = rvol if not np.isnan(rvol) else 1.0
-        context["volume_strong"] = context["rvol"] > 1.2
-
-        # 5. ATR context — enough movement potential?
-        context["atr"] = atr_val if not np.isnan(atr_val) else 0.0
-
-        # 6. Time of day — morning is higher conviction
-        bar_time = self._get_bar_time(bar)
-        if bar_time:
-            context["is_morning"] = bar_time < time(11, 30)
-            context["is_power_hour"] = bar_time >= time(14, 0)
-            context["is_lunch"] = time(12, 0) <= bar_time < time(13, 0)
-        else:
-            context["is_morning"] = False
-            context["is_power_hour"] = False
-            context["is_lunch"] = False
-
-        # 7. Gap from prior close — gap aligns with direction?
-        if session.prior_day_close > 0 and len(session.today_bars) > 0:
-            first_open = session.today_bars[0]["open"]
-            gap_pct = (first_open - session.prior_day_close) / session.prior_day_close
-            context["gap_pct"] = gap_pct
-            context["gap_aligned"] = (
-                (is_long and gap_pct > 0.001) or
-                (not is_long and gap_pct < -0.001)
-            )
-        else:
-            context["gap_pct"] = 0.0
-            context["gap_aligned"] = False
-
-        # 8. Prior day close position — closed strong or weak?
-        if session.prior_day_range > 0:
-            pdc_position = ((session.prior_day_close - session.prior_day_low)
-                            / session.prior_day_range)
-            context["prior_close_strong"] = (
-                (is_long and pdc_position > 0.6) or
-                (not is_long and pdc_position < 0.4)
-            )
-        else:
-            context["prior_close_strong"] = False
-
-        # 9. ORB width relative to average (for ORB events)
-        if session.orb_history:
-            avg_orb = np.mean(session.orb_history)
-            orb_range = event.features.get("orb_range", 0)
-            if avg_orb > 0 and orb_range > 0:
-                context["orb_width_ratio"] = orb_range / avg_orb
-                context["orb_narrow"] = context["orb_width_ratio"] < 0.8
-            else:
-                context["orb_width_ratio"] = 1.0
-                context["orb_narrow"] = False
-        else:
-            context["orb_width_ratio"] = 1.0
-            context["orb_narrow"] = False
-
-        # 10. Sweep overshoot relative to ATR (for sweep events)
-        overshoot = event.features.get("overshoot", 0)
-        if context["atr"] > 0 and overshoot > 0:
-            context["overshoot_atr_ratio"] = overshoot / context["atr"]
-            context["overshoot_meaningful"] = 0.15 < context["overshoot_atr_ratio"] < 1.5
-        else:
-            context["overshoot_atr_ratio"] = 0.0
-            context["overshoot_meaningful"] = False
-
-        return context
-
-    # ───────────────────────────────────────────────────────
-    #  SCORER — rule-based, debuggable, tunable
-    # ───────────────────────────────────────────────────────
-
-    def _score_event(self, event: MarketEvent, context: Dict) -> int:
-        """
-        Score 0-10 based on contextual features.
-        Each feature adds 0-2 points.
-
-        Why rule-based first (not ML):
-        - You can see WHY a trade was taken
-        - You can debug failures one rule at a time
-        - ML needs hundreds of samples; we'll have 30-50
-        - Move to ML later once you have labeled data
-        """
-        score = 0
-
-        # ── Universal context (all events) ──
-
-        # MA alignment: trend agrees with direction (+1)
-        if context.get("ma_aligned"):
-            score += 1
-
-        # RSI not overextended (+1)
-        if context.get("rsi_ok"):
-            score += 1
-
-        # VWAP position confirms direction (+2 — this is the #1 institutional filter)
-        if context.get("vwap_aligned"):
-            score += 2
-
-        # Volume above average (+1)
-        if context.get("volume_strong"):
-            score += 1
-
-        # Time of day: morning or power hour (+1), lunch penalty (-1)
-        if context.get("is_morning") or context.get("is_power_hour"):
-            score += 1
-        if context.get("is_lunch"):
-            score -= 1
-
-        # Gap aligns with direction (+1)
-        if context.get("gap_aligned"):
-            score += 1
-
-        # Prior day close supports direction (+1)
-        if context.get("prior_close_strong"):
-            score += 1
-
-        # ── Event-specific scoring ──
-
-        if event.name == "orb_breakout":
-            # Narrow ORB = compressed energy (+1)
-            if context.get("orb_narrow"):
-                score += 1
-
-        elif event.name == "orb_failure":
-            # Failed breakouts are inherently high-probability
-            # Give them a base bonus (+1)
-            score += 1
-
-        elif event.name == "session_sweep":
-            # Clean overshoot size (+1)
-            if context.get("overshoot_meaningful"):
-                score += 1
-
-        return max(0, score)  # Floor at 0
-
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
     #  EXIT MANAGEMENT
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
 
-    def _check_exit(self, symbol: str, bars: list) -> Optional[SignalEvent]:
-        """Manage open position: stop, target, trailing, timeout."""
-        direction = self._in_position[symbol]
-        price = bars[-1]["close"]
-        entry = self._entry_price[symbol]
-        stop = self._stop_price[symbol]
-        target = self._target_price[symbol]
-        bars_held = self._bar_count[symbol] - self._entry_bar_idx[symbol]
+    def _check_exit(self, symbol: str, bar: dict, bars: list,
+                    session: SessionState, bar_time: Optional[time]) -> Optional[SignalEvent]:
+        """Route to strategy-specific exit logic."""
+        strategy = self._in_position.get(symbol, "")
+        if strategy == "sweep_hq":
+            return self._exit_sweep_hq(symbol, bar)
+        if strategy == "orbfail_regime":
+            return self._exit_orbfail_regime(symbol, bar, bars, bar_time)
+        if strategy == "sweep_primary":
+            return self._exit_sweep_primary(symbol, bar, bar_time)
+        return None
 
-        # Compute current ATR for trailing
-        high_arr = np.array([b["high"] for b in bars])
-        low_arr = np.array([b["low"] for b in bars])
-        close_arr = np.array([b["close"] for b in bars])
-        atr_val = atr(high_arr, low_arr, close_arr, self.params["atr_period"])[-1]
-        if np.isnan(atr_val):
-            atr_val = abs(entry - stop) / self.params["risk_atr_mult"]
+    def _exit_sweep_hq(self, symbol: str, bar: dict) -> Optional[SignalEvent]:
+        """SWEEP_HQ exit: Fixed +1R target or stop.
 
-        should_exit = False
-        exit_reason = ""
-
-        # Trailing stop: after 1.5R profit, move stop to breakeven + 0.2 ATR
-        risk = abs(entry - stop)
-        trail_trigger = risk * self.params["trail_trigger_rr"]
+        Validated exit X3 (Fixed 1R) — best Sharpe (+0.899) for NVDA morning sweeps.
+        """
+        direction = self._pos_direction[symbol]
+        stop = self._pos_stop[symbol]
+        risk = self._pos_risk[symbol]
+        entry = self._pos_entry[symbol]
+        target = self._pos_target.get(symbol, entry + risk)
 
         if direction == "long":
-            current_profit = price - entry
-            if current_profit >= trail_trigger:
-                new_stop = max(stop, entry + atr_val * 0.2)
-                if new_stop > stop:
-                    self._stop_price[symbol] = new_stop
-                    stop = new_stop
+            if bar["low"] <= stop:
+                return self._emit_exit(symbol, "sweep_hq", direction,
+                                       bar["close"], entry, "stop")
+            if bar["high"] >= target:
+                return self._emit_exit(symbol, "sweep_hq", direction,
+                                       bar["close"], entry, "target_1r")
+        else:
+            if bar["high"] >= stop:
+                return self._emit_exit(symbol, "sweep_hq", direction,
+                                       bar["close"], entry, "stop")
+            if bar["low"] <= target:
+                return self._emit_exit(symbol, "sweep_hq", direction,
+                                       bar["close"], entry, "target_1r")
+        return None
 
-            if price <= stop:
-                should_exit, exit_reason = True, "stop"
-            elif price >= target:
-                should_exit, exit_reason = True, "target"
+    def _exit_orbfail_regime(self, symbol: str, bar: dict, bars: list,
+                              bar_time: Optional[time]) -> Optional[SignalEvent]:
+        """ORBFAIL_REGIME exit: 50%@1R → ATR trail on remainder, EOD fallback.
 
-        elif direction == "short":
-            current_profit = entry - price
-            if current_profit >= trail_trigger:
-                new_stop = min(stop, entry - atr_val * 0.2)
-                if new_stop < stop:
-                    self._stop_price[symbol] = new_stop
-                    stop = new_stop
+        X6 partial logic (matches validated research exactly):
+          Phase A (partial_done=False):
+            - Stop hit → full exit (stop signal).
+            - 1R hit   → emit 50% partial close signal to risk manager,
+                         activate ATR trail, keep position alive (partial_done=True).
+          Phase B (partial_done=True):
+            - Trail stop advances from intrabar high-water each bar.
+            - Trail hit → full exit of remaining 50% (trail signal).
+            - EOD 15:30 → full exit of remaining 50% (eod signal).
 
-            if price >= stop:
-                should_exit, exit_reason = True, "stop"
-            elif price <= target:
-                should_exit, exit_reason = True, "target"
+        The risk manager closes qty = int(position * partial_pct) on the
+        partial signal, and closes 100% of remaining qty on the final exit.
+        """
+        direction = self._pos_direction[symbol]
+        entry = self._pos_entry[symbol]
+        stop = self._pos_stop[symbol]
+        risk = self._pos_risk[symbol]
+        partial_done = self._pos_partial.get(symbol, False)
 
-        # Timeout
-        if bars_held >= self.params["max_hold_bars"]:
-            should_exit, exit_reason = True, "timeout"
+        atr_val = self._compute_atr(bars)
 
-        if should_exit:
-            pnl_pct = ((price - entry) / entry * 100) if direction == "long" else ((entry - price) / entry * 100)
-            is_win = pnl_pct > 0
-            event_name = self._entry_event.get(symbol, "unknown")
-            if is_win:
-                self._trades_by_event[event_name]["wins"] += 1
+        if direction == "long":
+            # Update high-water mark (wick-based, for ATR trail anchoring)
+            best = max(self._pos_best.get(symbol, entry), bar["high"])
+            self._pos_best[symbol] = best
 
-            exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
+            if partial_done:
+                # Advance ATR trail from the high-water
+                new_trail = best - atr_val
+                if new_trail > self._pos_stop[symbol]:
+                    self._pos_stop[symbol] = new_trail
+                stop = self._pos_stop[symbol]
 
-            # Clean up
-            del self._in_position[symbol]
-            self._entry_price.pop(symbol, None)
-            self._stop_price.pop(symbol, None)
-            self._target_price.pop(symbol, None)
-            self._entry_bar_idx.pop(symbol, None)
-            self._entry_event.pop(symbol, None)
+            # 1. Stop (or trail stop) hit → exit whatever remains
+            if bar["low"] <= stop:
+                reason = "trail" if partial_done else "stop"
+                return self._emit_exit(symbol, "orbfail_regime", direction,
+                                       bar["close"], entry, reason)
 
-            return SignalEvent(
-                symbol=symbol,
-                signal_type=exit_type,
-                strength=0.0,
-                strategy_name=self.name,
-                metadata={"exit_reason": exit_reason, "exit_price": round(price, 2),
-                          "entry_price": round(entry, 2)},
-            )
+            # 2. 1R target reached → emit 50% close, activate ATR trail on rest
+            if not partial_done and bar["high"] >= entry + risk:
+                self._pos_partial[symbol] = True
+                trail_stop = max(stop, entry + risk - atr_val)
+                self._pos_stop[symbol] = trail_stop
+                # Emit the partial close — risk manager reads partial_pct=0.5
+                return self._emit_partial_exit(symbol, "orbfail_regime", direction,
+                                               bar["close"], entry)
+
+            # 3. EOD fallback
+            elif bar_time is not None and bar_time >= self._EOD_TIME:
+                return self._emit_exit(symbol, "orbfail_regime", direction,
+                                       bar["close"], entry, "eod")
+
+        else:  # short (directional mirror — not currently triggered by research)
+            best = min(self._pos_best.get(symbol, entry), bar["low"])
+            self._pos_best[symbol] = best
+
+            if partial_done:
+                new_trail = best + atr_val
+                if new_trail < self._pos_stop[symbol]:
+                    self._pos_stop[symbol] = new_trail
+                stop = self._pos_stop[symbol]
+
+            if bar["high"] >= stop:
+                reason = "trail" if partial_done else "stop"
+                return self._emit_exit(symbol, "orbfail_regime", direction,
+                                       bar["close"], entry, reason)
+
+            if not partial_done and bar["low"] <= entry - risk:
+                self._pos_partial[symbol] = True
+                trail_stop = min(stop, entry - risk + atr_val)
+                self._pos_stop[symbol] = trail_stop
+                return self._emit_partial_exit(symbol, "orbfail_regime", direction,
+                                               bar["close"], entry)
+
+            elif bar_time is not None and bar_time >= self._EOD_TIME:
+                return self._emit_exit(symbol, "orbfail_regime", direction,
+                                       bar["close"], entry, "eod")
 
         return None
 
-    # ───────────────────────────────────────────────────────
-    #  UTILITIES
-    # ───────────────────────────────────────────────────────
+    def _exit_sweep_primary(self, symbol: str, bar: dict,
+                             bar_time: Optional[time]) -> Optional[SignalEvent]:
+        """SWEEP_PRIMARY exit: EOD hold (X1) or stop.
+
+        Validated exit X1 (EOD) — sweep trades run all session, taking the
+        full reversal move from PDL back toward PDH.
+        """
+        direction = self._pos_direction[symbol]
+        entry = self._pos_entry[symbol]
+        stop = self._pos_stop[symbol]
+
+        if direction == "long":
+            if bar["low"] <= stop:
+                return self._emit_exit(symbol, "sweep_primary", direction,
+                                       bar["close"], entry, "stop")
+            if bar_time is not None and bar_time >= self._EOD_TIME:
+                return self._emit_exit(symbol, "sweep_primary", direction,
+                                       bar["close"], entry, "eod")
+        else:
+            if bar["high"] >= stop:
+                return self._emit_exit(symbol, "sweep_primary", direction,
+                                       bar["close"], entry, "stop")
+            if bar_time is not None and bar_time >= self._EOD_TIME:
+                return self._emit_exit(symbol, "sweep_primary", direction,
+                                       bar["close"], entry, "eod")
+        return None
+
+    def _emit_exit(self, symbol: str, strategy: str, direction: str,
+                   price: float, entry: float, reason: str) -> SignalEvent:
+        """Record P&L diagnostics, clean up state, return exit signal."""
+        pnl_pct = ((price - entry) / entry * 100 if direction == "long"
+                   else (entry - price) / entry * 100)
+        if pnl_pct > 0:
+            self._trades_by_strategy[strategy]["wins"] += 1
+        self._exit_reasons[reason] += 1
+        self._clear_position(symbol)
+
+        exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
+        return SignalEvent(
+            symbol=symbol, signal_type=exit_type, strength=0.0,
+            strategy_name=self.name,
+            metadata={
+                "exit_reason": reason, "strategy": strategy,
+                "exit_price": round(price, 2), "entry_price": round(entry, 2),
+            },
+        )
+
+    def _emit_partial_exit(self, symbol: str, strategy: str, direction: str,
+                           price: float, entry: float) -> SignalEvent:
+        """Emit a 50% partial close WITHOUT clearing position state.
+
+        Position remains active so ATR trail continues on the remaining 50%.
+        Risk manager reads metadata['partial_pct'] = 0.5 and closes half.
+        """
+        exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
+        return SignalEvent(
+            symbol=symbol, signal_type=exit_type, strength=0.0,
+            strategy_name=self.name,
+            metadata={
+                "exit_reason": "partial_1r",
+                "strategy": strategy,
+                "exit_price": round(price, 2),
+                "entry_price": round(entry, 2),
+                "partial_pct": 0.5,
+            },
+        )
+
+    # ───────────────────────────────────────────────────────────
+    #  HELPER FUNCTIONS
+    # ───────────────────────────────────────────────────────────
+
+    def _is_near_intraday_extreme(self, session: SessionState,
+                                   sweep_wick: float) -> bool:
+        """True if sweep wick is within bottom 5% of recent 20-bar intraday range.
+
+        Computed at sweep-bar detection time (today_bars includes sweep bar).
+        """
+        n = min(20, len(session.today_bars))
+        if n < 2:
+            return True
+        recent = session.today_bars[-n:]
+        intra_high = max(b["high"] for b in recent)
+        intra_low = min(b["low"] for b in recent)
+        intra_range = intra_high - intra_low
+        if intra_range <= 0:
+            return True
+        pct_from_low = (sweep_wick - intra_low) / intra_range
+        return pct_from_low <= 0.05
+
+    def _compute_atr(self, bars: list, period: int = 14) -> float:
+        """Compute ATR from recent bar history using the features module."""
+        n = min(period * 3, len(bars))
+        if n < 2:
+            val = abs(bars[-1]["high"] - bars[-1]["low"]) if bars else 0.01
+            return max(val, 0.01)
+        recent = bars[-n:]
+        high_arr = np.array([b["high"] for b in recent])
+        low_arr = np.array([b["low"] for b in recent])
+        close_arr = np.array([b["close"] for b in recent])
+        vals = _atr_arr(high_arr, low_arr, close_arr, min(period, n - 1))
+        last = vals[-1] if len(vals) > 0 else np.nan
+        if np.isnan(last) or last <= 0:
+            return max(abs(bars[-1]["high"] - bars[-1]["low"]), 0.01)
+        return float(last)
 
     def _get_bar_time(self, bar: dict) -> Optional[time]:
         ts = bar.get("timestamp")
-        if ts is not None and hasattr(ts, 'time'):
+        if ts is not None and hasattr(ts, "time"):
             return ts.time()
         return None
 
     def _get_bar_date(self, bar: dict) -> Optional[date]:
         ts = bar.get("timestamp")
-        if ts is not None and hasattr(ts, 'date'):
+        if ts is not None and hasattr(ts, "date"):
             return ts.date() if callable(ts.date) else ts.date
         return None
 
-    def _add_minutes(self, t: time, minutes: int) -> time:
-        total = t.hour * 60 + t.minute + minutes
-        return time(total // 60, total % 60)
-
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
     #  DIAGNOSTICS
-    # ───────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────
 
-    def get_diagnostics(self) -> Dict:
+    def get_diagnostics(self) -> dict:
         return {
-            "total_bars": self._total_bars,
-            "total_events": self._total_events,
             "total_trades": self._total_trades,
-            "events_detected": dict(self._events_detected),
-            "events_scored": {k: dict(v) for k, v in self._events_scored.items()},
-            "trades_by_event": {k: dict(v) for k, v in self._trades_by_event.items()},
-            "score_distribution": dict(self._score_distribution),
+            "trades_by_strategy": {k: dict(v)
+                                    for k, v in self._trades_by_strategy.items()},
+            "exit_reasons": dict(self._exit_reasons),
         }
 
-    def print_funnel(self):
-        print(f"\n  EVENT-DRIVEN STRATEGY")
-        print(f"  {'═'*55}")
-        print(f"  Architecture: Event → Context → Score → Trade")
-        print(f"  {'─'*55}")
-        print(f"  Total bars scanned:       {self._total_bars:>8,}")
-        print(f"  Events detected:          {self._total_events:>8,}  "
-              f"({self._total_events / max(self._total_bars, 1) * 100:.1f}% of bars)")
-        print(f"  Events traded:            {self._total_trades:>8,}  "
-              f"(score >= {self.params['score_threshold']})")
-        no_event_bars = self._total_bars - self._total_events
-        print(f"  Bars with NO action:      {no_event_bars:>8,}  "
-              f"({no_event_bars / max(self._total_bars, 1) * 100:.1f}%)")
+    def print_funnel(self) -> None:
+        """Print strategy summary (compatible with demo_backtest.py call site)."""
+        print(f"\n  EVENT-DRIVEN STRATEGY v10 (Research-Validated)")
+        print(f"  {'═' * 65}")
+        print(f"  Three strategies, all validated via Phase 0→4 walk-forward pipeline")
+        print(f"  {'─' * 65}")
 
-        print(f"\n  Events by Type:")
-        for ename, count in sorted(self._events_detected.items()):
-            scored = self._events_scored.get(ename, {"passed": 0, "failed": 0})
-            traded = self._trades_by_event.get(ename, {"count": 0, "wins": 0})
-            win_rate = (traded["wins"] / traded["count"] * 100
-                        if traded["count"] > 0 else 0)
-            print(f"    {ename:>20}: {count:>4} detected │ "
-                  f"{scored['passed']:>3} traded │ "
-                  f"{traded['wins']}/{traded['count']} won ({win_rate:.0f}%)")
+        rows = [
+            ("sweep_hq",
+             "NVDA PDL + gap_pos + prior_up + not_fri",
+             "4/4 PASS", "+0.933", "Fixed +1R", "Full"),
+            ("orbfail_regime",
+             "not_goog + gap_up + fail_above_vwap",
+             "4/4 PASS", "+0.704", "50%@1R + ATR trail", "Full"),
+            ("sweep_primary",
+             "all + prior_up + midweek + near_extreme",
+             "2/4 MARGINAL", "~+0.29", "EOD", "Half"),
+        ]
 
-        print(f"\n  Score Distribution:")
-        for score in sorted(self._score_distribution.keys()):
-            count = self._score_distribution[score]
-            threshold_marker = " ← threshold" if score == self.params["score_threshold"] else ""
-            bar = "█" * count
-            traded = "✓" if score >= self.params["score_threshold"] else "✗"
-            print(f"    Score {score:>2}: {count:>4} events {traded} {bar}{threshold_marker}")
+        print(f"\n  {'Strategy':<18} {'WF':>12} {'OOS Sharpe':>11} "
+              f"{'Exit':>20} {'Size':>5}  Trades/WR")
+        print(f"  {'─' * 75}")
+        for strat, desc, wf, sharpe, exit_m, sz in rows:
+            tr = self._trades_by_strategy[strat]
+            count, wins = tr["count"], tr["wins"]
+            wr = f"{wins/count*100:.0f}%" if count > 0 else "—"
+            print(f"  {strat:<18} {wf:>12} {sharpe:>11} {exit_m:>20} "
+                  f"{sz:>5}  {count} trades, WR {wr}")
+            print(f"    Filter: {desc}")
 
-        print(f"  {'═'*55}")
+        print(f"\n  Total trades  : {self._total_trades}")
+        if self._exit_reasons:
+            print(f"  Exit reasons  :")
+            for reason, count in sorted(self._exit_reasons.items(),
+                                        key=lambda x: -x[1]):
+                pct = count / max(1, self._total_trades) * 100
+                print(f"    {reason:>15}: {count:>5}  ({pct:.1f}%)")
