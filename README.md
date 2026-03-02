@@ -104,7 +104,7 @@ backtest:
 
 ---
 
-## Step 1 — Download Historical Data
+## Step 1 -> Download Historical Data
 
 Data is fetched from Alpaca Markets (free paper account, no credit card needed).
 
@@ -131,7 +131,7 @@ The script skips files already on disk — safe to re-run.
 
 ---
 
-## Step 2 — Run Backtest
+## Step 2 -> Run Backtest
 
 ```bash
 # Full 2-year backtest on all 10 symbols (uses local cache, IBKR not needed)
@@ -153,7 +153,7 @@ python3 main.py backtest -s event_driven -i 15m -d ibkr \
 
 ---
 
-## Step 3 — Run Validation
+## Step 3 -> Run Validation
 
 Implements 5 rigorous validation checks:
 1. Walk-forward consistency (3 rolling windows)
@@ -182,7 +182,7 @@ python3 main.py validate -s event_driven -i 15m -d ibkr \
 
 ---
 
-## Step 4 — Launch Web Dashboard
+## Step 4 -> Launch Web Dashboard
 
 ```bash
 python3 web_app.py
@@ -202,7 +202,7 @@ equity curve with trade markers, drawdown fill, per-trade P&L bars with cumulati
 
 ---
 
-## Step 5 — Paper Trading (IBKR)
+## Step 5 -> Paper Trading (IBKR)
 
 Requires Interactive Brokers TWS or IB Gateway running in paper mode.
 
@@ -245,19 +245,19 @@ Statistical tests run on combined trade pool:
 The strategies were built through a rigorous multi-phase research pipeline:
 
 ```
-Phase 0  — Raw edge test (does the event have any edge at all?)
-Phase 0.5 — Edge decomposition (which sub-conditions drive the edge?)
-Phase 1  — Entry method comparison (M1 sweep_close vs M2 conf_close vs limit vs retest)
-Phase 2  — Exit method comparison (EOD vs VWAP vs fixed 1R vs ATR trail)
-Phase 3  — Regime filter (gap, prior-day direction, volatility, time-of-day)
-Phase 4  — Walk-forward validation (anchored windows, IS/OOS split)
+Phase 0  : Raw edge test (does the event have any edge at all?)
+Phase 0.5 : Edge decomposition (which sub-conditions drive the edge?)
+Phase 1  : Entry method comparison (M1 sweep_close vs M2 conf_close vs limit vs retest)
+Phase 2  : Exit method comparison (EOD vs VWAP vs fixed 1R vs ATR trail)
+Phase 3  : Regime filter (gap, prior-day direction, volatility, time-of-day)
+Phase 4  : Walk-forward validation (anchored windows, IS/OOS split)
 ```
 
 **Events tested:**
-- ORB (Opening Range Breakout) — raw edge is -0.046R unfiltered; marginal filtered
-- Session Sweep + Rejection (PDH/PDL) — SWEEP_HQ: +0.933 Sharpe validated
-- ORB Failure (Fade) — ORBFAIL_REGIME: +0.704 Sharpe validated
-- Volatility Compression — DROPPED at Phase 0 (no edge, -0.007R)
+- ORB (Opening Range Breakout) -- raw edge is -0.046R unfiltered; marginal filtered
+- Session Sweep + Rejection (PDH/PDL) -- SWEEP_HQ: +0.933 Sharpe validated
+- ORB Failure (Fade) -- ORBFAIL_REGIME: +0.704 Sharpe validated
+- Volatility Compression -- DROPPED at Phase 0 (no edge, -0.007R)
 
 Research scripts: `phase0_raw_edge.py`, `sweep_phase0_raw_edge.py`, `orbfail_phase0_raw_edge.py`, etc.
 
@@ -266,7 +266,7 @@ Research scripts: `phase0_raw_edge.py`, `sweep_phase0_raw_edge.py`, `orbfail_pha
 ## Key Technical Decisions
 
 **Why bar-close entry (not limit)?**
-Limit entries suffer adverse selection on ORB trades — fills concentrate on losers.
+Limit entries suffer adverse selection on ORB trades -- fills concentrate on losers.
 Bar-close (market order at next bar) avoids this. Sweep strategies show the opposite: limits work because sweeps retest the level.
 
 **Why no look-ahead bias?**
@@ -332,4 +332,4 @@ pip install -r requirements.txt
 
 ## Disclaimer
 
-This project is for educational and research purposes. Past backtest performance does not guarantee future results. Paper trading only — do not use with real capital without independent review. This is project aims to stress test ideas and how its implemented and validated.
+This project is for educational and research purposes. Past backtest performance does not guarantee future results. Paper trading only -- do not use with real capital without independent review. This is project aims to stress test ideas and how its implemented and validated.
