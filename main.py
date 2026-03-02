@@ -800,6 +800,13 @@ def backtest(strategy, start, end, interval, source, config):
     engine.export_trades()
     report_path = engine.export_report()
 
+    from backtest.dashboard import plot_backtest_dashboard
+    dashboard_path = plot_backtest_dashboard(report_path, "./backtest_dashboard.png")
+
+    print(f"\n  Outputs:")
+    print(f"    Chart     : {chart_path}")
+    print(f"    Dashboard : {dashboard_path}")
+    print(f"    Report    : {report_path}")
     print(f"\n  To visualize this backtest:")
     print(f"  python visualizer.py --report {report_path}")
     print()
@@ -814,8 +821,10 @@ def backtest(strategy, start, end, interval, source, config):
               help="Data source")
 @click.option("--windows", "-w", default=3, help="Walk-forward windows (default: 3)")
 @click.option("--mc", default=1000, help="Monte Carlo simulations (default: 1000)")
+@click.option("--save-report", is_flag=True, default=False,
+              help="Save validation results as validation_results.json for web dashboard")
 @click.option("--config", "-c", default=None, help="Config file path")
-def validate(strategy, start, end, interval, source, windows, mc, config):
+def validate(strategy, start, end, interval, source, windows, mc, save_report, config):
     """Validate strategy: walk-forward + out-of-sample + Monte Carlo.
 
     \b
@@ -830,7 +839,7 @@ def validate(strategy, start, end, interval, source, windows, mc, config):
         ibkr_cfg = cfg.get("ibkr", {})
 
     from backtest.validate import run_validation
-    run_validation(
+    val_results = run_validation(
         config=cfg,
         strategy_name=strategy,
         start=start or "2025-01-01",
@@ -840,6 +849,39 @@ def validate(strategy, start, end, interval, source, windows, mc, config):
         n_walk_forward=windows,
         mc_simulations=mc,
     )
+
+    if val_results:
+        from backtest.dashboard import plot_validation_dashboard
+        plot_validation_dashboard(val_results, "./validation_dashboard.png")
+
+        if save_report:
+            import json as _json
+
+            def _make_serializable(obj):
+                """Recursively convert numpy types to Python native types."""
+                import numpy as _np
+                import pandas as _pd
+                if isinstance(obj, dict):
+                    return {k: _make_serializable(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_make_serializable(v) for v in obj]
+                if isinstance(obj, _np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, (_np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (_np.floating,)):
+                    return float(obj)
+                if isinstance(obj, _pd.DataFrame):
+                    return obj.to_dict(orient="records")
+                if isinstance(obj, _pd.Series):
+                    return obj.tolist()
+                return obj
+
+            report_out = _make_serializable(val_results)
+            with open("./validation_results.json", "w") as _f:
+                _json.dump(report_out, _f, indent=2, default=str)
+            print(f"\n  Validation report saved: ./validation_results.json")
+            print(f"  Launch dashboard: python web_app.py")
 
 
 @cli.command()

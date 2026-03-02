@@ -98,6 +98,15 @@ class RiskManager:
         # Maps order_id → signal metadata dict
         self._signal_metadata: Dict[str, Dict] = {}
 
+        # ═══ v6: Regime-aware sizing diagnostics ═══
+        # Strategy passes regime_risk_scale in signal metadata:
+        #   CALM=1.0  TRENDING=1.0/0.5  VOLATILE=0.5  CRISIS=0.25
+        # We multiply risk_per_trade_pct by this scale.
+        # If no regime info (other strategies), defaults to 1.0 (no change).
+        self._regime_scaled_count = 0       # Orders where regime scale < 1.0
+        self._regime_scale_sum = 0.0        # Sum of all scales (for avg)
+        self._regime_order_count = 0        # Total orders with regime info
+
         # Subscribe to events
         self.event_bus.subscribe(EventType.SIGNAL, self.on_signal)
         self.event_bus.subscribe(EventType.MARKET_DATA, self.on_market_data)
@@ -344,10 +353,16 @@ class RiskManager:
             # Store signal metadata (stop, target, etc.) for visualizer
             self._signal_metadata[order.order_id] = signal.metadata.copy()
             self.event_bus.publish(order)
+
+            # v6: Include regime info in log if present
+            regime_label = signal.metadata.get("regime_label", "")
+            regime_scale = signal.metadata.get("regime_risk_scale", "")
+            regime_str = f" [{regime_label}×{regime_scale}]" if regime_label else ""
+
             self._log_risk_event("APPROVED", order.symbol, signal.strategy_name,
                                  f"{order.side.value} {order.quantity} {order.symbol} "
                                  f"@ ~${self._latest_prices.get(order.symbol, 0):.2f}"
-                                 f"{' [EXIT]' if is_exit else ''}")
+                                 f"{' [EXIT]' if is_exit else ''}{regime_str}")
         else:
             self._log_risk_event("REJECTED", order.symbol, signal.strategy_name, reason)
 
@@ -360,8 +375,17 @@ class RiskManager:
         2. RISK-PER-TRADE: if signal has stop_loss in metadata, size so that
            hitting the stop loses at most risk_per_trade_pct of portfolio (e.g., 3%)
 
-        This mimics how prop firms size: "I'm willing to lose 3% of my capital
-        on this trade, and my stop is 1.5% away, so I can buy X shares."
+        v6: Regime-aware scaling.
+        If signal.metadata contains "regime_risk_scale", we multiply
+        risk_per_trade_pct by that scale before calculating size:
+          CALM (1.0):       3% risk → 3% risk (unchanged)
+          TRENDING w/ (1.0): 3% risk → 3% risk
+          TRENDING ctr (0.5): 3% risk → 1.5% risk
+          VOLATILE (0.5):   3% risk → 1.5% risk
+          CRISIS (0.25):    3% risk → 0.75% risk
+
+        Same entry, same stop — but position size shrinks in dangerous regimes.
+        This is how you survive 5 consecutive losses in a stressed market.
 
         Also enforces minimum order value to avoid commission-eaten tiny trades.
         """
@@ -374,6 +398,22 @@ class RiskManager:
         portfolio_value = self.portfolio.total_value
         if portfolio_value <= 0:
             return None
+
+        # ═══ v6: Regime-adjusted risk per trade ═══
+        # Read regime_risk_scale from strategy metadata.
+        # If not present (e.g. other strategies), defaults to 1.0 (no change).
+        regime_risk_scale = signal.metadata.get("regime_risk_scale", 1.0)
+        # Clamp: never amplify beyond base, never go below 10% of base
+        regime_risk_scale = max(0.10, min(regime_risk_scale, 1.0))
+        # Apply: base 3% × regime scale
+        effective_risk_pct = self.risk_per_trade_pct * regime_risk_scale
+
+        # Track regime sizing for diagnostics
+        if "regime_risk_scale" in signal.metadata:
+            self._regime_order_count += 1
+            self._regime_scale_sum += regime_risk_scale
+            if regime_risk_scale < 1.0:
+                self._regime_scaled_count += 1
 
         # Get current position
         current_qty = 0
@@ -389,11 +429,12 @@ class RiskManager:
             target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
 
             # Method 2: Risk-per-trade (if stop loss provided in signal metadata)
+            # v6: uses effective_risk_pct (regime-adjusted) instead of base
             stop_price = signal.metadata.get("stop")
             if stop_price and stop_price > 0 and stop_price < price:
                 stop_distance_pct = (price - stop_price) / price
                 if stop_distance_pct > 0.001:  # Avoid division by tiny stop
-                    risk_budget = portfolio_value * self.risk_per_trade_pct
+                    risk_budget = portfolio_value * effective_risk_pct
                     risk_based_value = risk_budget / stop_distance_pct
                     target_value = min(target_value, risk_based_value)
 
@@ -415,12 +456,12 @@ class RiskManager:
             remaining_value = max(0, max_allowed_value - current_position_value)
             target_value = remaining_value * max(0.1, min(signal.strength, 1.0))
 
-            # Risk-per-trade for shorts
+            # Risk-per-trade for shorts — v6: regime-adjusted
             stop_price = signal.metadata.get("stop")
             if stop_price and stop_price > 0 and stop_price > price:
                 stop_distance_pct = (stop_price - price) / price
                 if stop_distance_pct > 0.001:
-                    risk_budget = portfolio_value * self.risk_per_trade_pct
+                    risk_budget = portfolio_value * effective_risk_pct
                     risk_based_value = risk_budget / stop_distance_pct
                     target_value = min(target_value, risk_based_value)
 
@@ -434,10 +475,14 @@ class RiskManager:
             side = OrderSide.SELL
 
         elif signal.signal_type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT, SignalType.FLAT):
-            # Close position — no sizing logic, just close what we have
+            # Close position — support partial_pct for staged exits (e.g. ORBFAIL 50%@1R)
             if current_qty == 0:
                 return None
-            qty_to_trade = abs(current_qty)
+            partial_pct = signal.metadata.get("partial_pct", 1.0)
+            if partial_pct < 1.0:
+                qty_to_trade = max(1, int(abs(current_qty) * partial_pct))
+            else:
+                qty_to_trade = abs(current_qty)
             side = OrderSide.SELL if current_qty > 0 else OrderSide.BUY
         else:
             return None
@@ -575,6 +620,17 @@ class RiskManager:
     def get_status(self) -> Dict:
         """Current risk status summary."""
         portfolio_value = self.portfolio.total_value
+
+        # v6: regime sizing stats
+        regime_stats = {}
+        if self._regime_order_count > 0:
+            avg_scale = self._regime_scale_sum / self._regime_order_count
+            regime_stats = {
+                "regime_orders": self._regime_order_count,
+                "regime_scaled": self._regime_scaled_count,
+                "regime_avg_scale": round(avg_scale, 3),
+            }
+
         return {
             "trading_halted": self._trading_halted,
             "halt_reason": self._halt_reason,
@@ -590,4 +646,5 @@ class RiskManager:
                 if portfolio_value > 0
                 else 0.0
             ),
+            **regime_stats,
         }
