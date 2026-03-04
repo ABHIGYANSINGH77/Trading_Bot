@@ -1769,7 +1769,6 @@ with st.sidebar:
         _labels.append(name)   # radio value = plain name
 
     page = st.radio("Navigation", options=_labels,
-                    key="page",
                     label_visibility="collapsed",
                     format_func=lambda x: x)
 
@@ -1800,34 +1799,6 @@ with st.sidebar:
         ~130k bars &nbsp;·&nbsp; 2,228 events
       </div>
     </div>""", unsafe_allow_html=True)
-
-# ── Top navigation bar (always visible even when sidebar is collapsed) ──────
-_TOP_LABELS = [
-    ("Overview",   "Research Overview"),
-    ("ORB",        "ORB Strategy"),
-    ("Sweeps",     "Session Sweeps"),
-    ("Failure",    "ORB Failure"),
-    ("WF & MC",    "Walk-Forward & Monte Carlo"),
-    ("Strategies", "Live Strategies"),
-    ("Explorer",   "Interactive Explorer"),
-    ("Paper",      "Live Paper Trading"),
-    ("AI",         "AI Research Assistant"),
-]
-_tcols = st.columns(len(_TOP_LABELS))
-for _tc, (_tlabel, _tpage) in zip(_tcols, _TOP_LABELS):
-    _is_active = st.session_state.get("page", "Research Overview") == _tpage
-    if _tc.button(
-        _tlabel,
-        use_container_width=True,
-        type="primary" if _is_active else "secondary",
-        key=f"topnav_{_tpage}",
-    ):
-        st.session_state.page = _tpage
-        st.rerun()
-
-st.markdown('<div style="margin-bottom:.5rem;"></div>', unsafe_allow_html=True)
-
-page = st.session_state.get("page", "Research Overview")
 
 {
     "Research Overview":       page_overview,
