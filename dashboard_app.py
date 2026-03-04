@@ -59,22 +59,8 @@ st.markdown(f"""
   .sc-k{{color:{MUTED};}}
   #MainMenu{{visibility:hidden;}}
   footer{{visibility:hidden;}}
-  header{{visibility:hidden;}}
-  [data-testid="collapsedControl"]{{
-    visibility:visible !important;
-    background:{CARD} !important;
-    border:1px solid {BORD} !important;
-    border-radius:0 6px 6px 0 !important;
-  }}
-  [data-testid="collapsedControl"] button{{
-    visibility:visible !important;
-    color:{AMB} !important;
-  }}
-  [data-testid="collapsedControl"] svg{{
-    visibility:visible !important;
-    fill:{AMB} !important;
-    stroke:{AMB} !important;
-  }}
+  [data-testid="stToolbar"]{{display:none !important;}}
+  [data-testid="stDecoration"]{{display:none !important;}}
 </style>
 """, unsafe_allow_html=True)
 
