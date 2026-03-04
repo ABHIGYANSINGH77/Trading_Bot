@@ -154,7 +154,7 @@ python3 main.py paper -s event_driven
 
 ### Streamlit (hosted - recommended for viewers)
 
-Live at: **[share.streamlit.io/ABHIGYANSINGH77/Trading_Bot](https://abhigyansingh77-trading-bot-dashboard-app-8s77bm.streamlit.app/)**
+Live at: **[QuantEdge](https://quantedge.streamlit.app/)**
 
 No setup needed. All research results are pre-loaded from committed JSON files.
 
