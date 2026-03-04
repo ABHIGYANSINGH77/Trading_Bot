@@ -58,8 +58,6 @@ st.markdown(f"""
   .sc-r{{font-size:0.73rem;margin:0.2rem 0;line-height:1.5;}}
   .sc-k{{color:{MUTED};}}
   #MainMenu,footer,header{{visibility:hidden;}}
-  [data-testid="stSidebarCollapseButton"]{{display:none !important;}}
-  [data-testid="stSidebarHeader"] button{{display:none !important;}}
 </style>
 """, unsafe_allow_html=True)
 
