@@ -1519,11 +1519,58 @@ def page_paper():
     sessions = _load_paper_sessions()
 
     if not sessions:
-        st.info(
-            "No paper sessions found. Run:  \n"
-            "```\npython3 main.py paper -s event_driven -i 15m\n```\n"
-            "Sessions are saved automatically to `paper_sessions/`."
-        )
+        st.markdown("""
+<div style="background:#0d1826;border:1px solid #1e3a5f;border-radius:10px;padding:28px 32px;margin:12px 0;">
+  <div style="color:#4fc3f7;font-size:1.05rem;font-weight:700;letter-spacing:.05em;margin-bottom:6px;">
+    ℹ️ &nbsp;No live sessions found on this server
+  </div>
+  <div style="color:#8ab4cc;font-size:.88rem;line-height:1.7;margin-bottom:20px;">
+    Paper trading sessions are generated on <strong style="color:#e0e6ed;">your local machine</strong>
+    and are not stored in this public deployment.
+    To run the live monitor yourself, clone the repo and follow the steps below.
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 1 — Clone & install</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:16px;">
+    git clone https://github.com/ABHIGYANSINGH77/Trading_Bot.git<br>
+    cd Trading_Bot<br>
+    pip install -r requirements.txt
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 2 — Add your Alpaca paper-account keys</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:16px;">
+    export ALPACA_API_KEY="PKxxxxxxxxxxxxxxxx"<br>
+    export ALPACA_API_SECRET="xxxxxxxxxxxxxxxxxxxxxxxx"
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 3 — Copy and fill in your config</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:16px;">
+    cp config/settings_template.yaml config/settings.yaml<br>
+    <span style="color:#607d8b;"># edit settings.yaml — set initial_capital, commission, universe</span>
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 4 — Fetch 15-min bar data</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:16px;">
+    python3 fetch_alpaca_data.py
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 5 — Run Alpaca live paper trading (polls every 60 s during market hours)</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:16px;">
+    python3 main.py alpaca
+  </div>
+
+  <div style="color:#4fc3f7;font-weight:600;font-size:.85rem;margin-bottom:10px;">STEP 6 — Open this dashboard locally to see live updates</div>
+  <div style="background:#060c14;border-radius:6px;padding:12px 16px;font-family:monospace;font-size:.82rem;color:#c9d8e8;margin-bottom:4px;">
+    streamlit run dashboard_app.py
+  </div>
+
+  <div style="color:#546e7a;font-size:.78rem;margin-top:16px;">
+    💡 The dashboard auto-refreshes every 30 s. Sessions are saved to <code style="color:#8ab4cc;">paper_sessions/</code>
+    and appear here automatically as trades are generated during market hours (09:30–16:00 ET).
+    No real money is used — Alpaca paper accounts are free and simulated.
+  </div>
+</div>
+""", unsafe_allow_html=True)
         st.button("Refresh", on_click=st.cache_data.clear)
         return
 
