@@ -710,13 +710,16 @@ def run_validation(
     print(f"  MONTE CARLO BOOTSTRAP ({mc_simulations:,} resamples)")
     print(f"{'─'*65}")
 
-    # Collect all trade P&Ls from all backtests
+    # Collect OOS-only trade P&Ls for Monte Carlo.
+    # We intentionally exclude training trades because anchored WF windows have
+    # OVERLAPPING training periods (window N's train includes all of window 1..N-1
+    # test periods). Including train trades would triple-count early trades and
+    # produce a biased distribution. Only test (held-out) trades are unbiased.
     all_pnls = []
     for w in wf_results:
-        for phase in ("train", "test"):
-            paired = w[phase]["paired_trades"]
-            if not paired.empty and "net_pnl" in paired.columns:
-                all_pnls.extend(paired["net_pnl"].tolist())
+        paired = w["test"]["paired_trades"]
+        if not paired.empty and "net_pnl" in paired.columns:
+            all_pnls.extend(paired["net_pnl"].tolist())
 
     oos_paired = oos_result["paired_trades"]
     if not oos_paired.empty and "net_pnl" in oos_paired.columns:
@@ -835,10 +838,15 @@ def run_validation(
         print(f"  t-stat / p-value  : t={sig_result['t_stat']:.2f},  p={sig_result['p_value']:.4f}")
         print(f"  Trades used       : {sig_result['n_trades']}  (~{tpy}/yr assumed)")
 
-        if sig_result["is_significant"]:
+        sharpe_val = sig_result["sharpe"]
+        if sharpe_val < 0 and sig_result["p_value"] < 0.05:
+            print(f"  ✗ Statistically significant NEGATIVE edge (p={sig_result['p_value']:.4f})")
+        elif sig_result["is_significant"]:
             print(f"  ✓ Edge is statistically significant (p < 0.05, CI lower bound > 0)")
+        elif sig_result["p_value"] < 0.10 and sharpe_val > 0:
+            print(f"  ~ Marginal positive edge (p < 0.10) — more trades needed for confidence")
         elif sig_result["p_value"] < 0.10:
-            print(f"  ~ Marginal significance (p < 0.10) — more trades needed for confidence")
+            print(f"  ~ Marginal significance (p < 0.10)")
         else:
             print(f"  ✗ Edge NOT statistically significant at 5% level")
     else:

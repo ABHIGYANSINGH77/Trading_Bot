@@ -71,8 +71,13 @@ class SimulatedExecution:
         if price is None or price <= 0:
             return  # Can't fill without a price
 
-        # Apply slippage
-        if order.side == OrderSide.BUY:
+        # Honor limit_price when set (used for stop/target exits to fill at
+        # exact stop or target level, matching research script assumptions).
+        # No additional slippage — the stop/target price is already
+        # the worst-case fill for that type of exit.
+        if order.limit_price is not None and order.limit_price > 0:
+            fill_price = float(order.limit_price)
+        elif order.side == OrderSide.BUY:
             fill_price = price * (1 + self.slippage_pct)
         else:
             fill_price = price * (1 - self.slippage_pct)

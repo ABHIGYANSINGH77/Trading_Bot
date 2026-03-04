@@ -1,0 +1,13 @@
+# Dashboard-only requirements for Streamlit Community Cloud.
+# The full requirements.txt includes IBKR, backtesting, and ML packages
+# that aren't needed for the public dashboard.
+#
+# On Streamlit Cloud: point the app at dashboard_app.py and set
+# "Requirements file" to requirements_dashboard.txt in app settings.
+
+numpy>=1.24.0
+pandas>=2.0.0
+plotly>=5.15.0
+streamlit>=1.35.0
+pyyaml>=6.0
+anthropic>=0.30.0

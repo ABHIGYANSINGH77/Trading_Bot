@@ -17,6 +17,8 @@ matplotlib>=3.7.0
 plotly>=5.15.0
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
+streamlit>=1.35.0
+anthropic>=0.30.0
 
 # Utilities
 pyyaml>=6.0

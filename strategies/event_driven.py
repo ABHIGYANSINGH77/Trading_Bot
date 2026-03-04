@@ -17,7 +17,7 @@ Three strategies validated through independent Phase 0→4 research pipeline
 
   SWEEP_PRIMARY     All-symbol PDL sweep, midweek, near intraday extreme
                     OOS Sharpe ~+0.29, 2/4 WF pass — MARGINAL (half position)
-                    Filters: LONG + prior_up + midweek(Tue/Wed/Thu) + near_extreme
+                    Filters: LONG + prior_up + midweek(Tue/Wed/Thu) + near_extreme + RVOL≥1.0x
                     Entry : confirmation-bar close (M2) | Stop: sweep wick
                     Exit  : EOD (hold all session)
 
@@ -26,7 +26,7 @@ ORB-breakout momentum: not implemented — Phase 4 WF marginal, superseded by
   ORBFAIL_REGIME which uses the same events more profitably via fade.
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import time, date
 from typing import Dict, List, Optional
 
@@ -35,6 +35,11 @@ import numpy as np
 from core.events import EventBus, EventType, MarketDataEvent, SignalEvent, SignalType
 from strategies import BaseStrategy
 from features import atr as _atr_arr
+
+# Must match SimulatedExecution.slippage_pct so targets are exactly 1R from fill.
+# Entry fills at close × (1 + ENTRY_SLIPPAGE) for longs,
+#               close × (1 - ENTRY_SLIPPAGE) for shorts.
+ENTRY_SLIPPAGE = 0.001
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -135,7 +140,7 @@ class SessionState:
             self.today_open = bar["open"]
             if self.prior_day_close > 0:
                 self.gap_pct = (bar["open"] - self.prior_day_close) / self.prior_day_close
-                self.gap_pos = self.gap_pct > 0.002   # > +0.2%
+                self.gap_pos = self.gap_pct > 0.002   # > +0.2% (threshold applied below)
 
         # Running VWAP (session-cumulative, no look-ahead)
         tp = (bar["high"] + bar["low"] + bar["close"]) / 3.0
@@ -178,6 +183,13 @@ class EventDrivenStrategy(BaseStrategy):
             "symbols": ["AAPL", "NVDA", "MSFT", "AMZN", "GOOG"],
             "min_bars": 30,
             "atr_period": 14,
+            # Tunable filter thresholds — override in config or precompute_grid.py
+            "gap_threshold": 0.002,       # min abs gap for gap_pos flag (default 0.2%)
+            "rvol_threshold_sweep": 1.0,  # min RVOL for SWEEP_PRIMARY (0.0 = off)
+            # Strategy toggles — set False to disable a sub-strategy entirely
+            "enable_sweep_hq": True,
+            "enable_orbfail": True,
+            "enable_sweep_primary": True,
         }
         merged = {**default_params, **(params or {})}
         super().__init__("event_driven", event_bus, merged)
@@ -195,6 +207,12 @@ class EventDrivenStrategy(BaseStrategy):
         self._pos_target: Dict[str, float] = {}     # SWEEP_HQ fixed 1R target
         self._pos_partial: Dict[str, bool] = {}     # ORBFAIL: has 1R been reached?
         self._pos_best: Dict[str, float] = {}       # ORBFAIL: high-water for ATR trail
+
+        # ── RVOL tracking (Zarattini 2024): first-bar relative volume filter ──
+        # Stores up to 15 days of first-bar volumes for the rolling 14-day average.
+        self._first_bar_vol_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=15))
+        self._daily_rvol: Dict[str, float] = {}
 
         # ── Diagnostics ──
         self._total_trades = 0
@@ -236,7 +254,24 @@ class EventDrivenStrategy(BaseStrategy):
             session.new_day(prior_bars)
             session.current_date = bar_date
 
+            # ── RVOL: compute today's relative volume from prior history ──
+            # Use history of prior days only (no look-ahead) — matches rvol_phase0.py.
+            vol_history = list(self._first_bar_vol_history[symbol])
+            first_vol = bar.get("volume", 0.0)
+            if len(vol_history) >= 5:
+                avg_vol = float(np.mean(vol_history[-14:]))
+                self._daily_rvol[symbol] = (first_vol / avg_vol) if avg_vol > 0 else 1.0
+            else:
+                self._daily_rvol[symbol] = 1.0  # insufficient history → no filter
+            # Append current first-bar volume for future days' RVOL computation.
+            self._first_bar_vol_history[symbol].append(first_vol)
+
         session.update_bar(bar)
+
+        # ── Apply configurable gap threshold (overrides SessionState default 0.2%) ──
+        gap_thr = self.params.get("gap_threshold", 0.002)
+        if len(session.today_bars) == 1 and session.prior_day_close > 0:
+            session.gap_pos = session.gap_pct > gap_thr
 
         # ── Build ORB (first 2 bars = 9:30 and 9:45) ──
         if not session.orb_defined and bar_time is not None:
@@ -266,21 +301,24 @@ class EventDrivenStrategy(BaseStrategy):
             self._update_orb_bo_tracking(bar, session)
 
         # ── Strategy 1: SWEEP_HQ (NVDA only) ──
-        if symbol == "NVDA" and bar_time is not None:
+        if (self.params.get("enable_sweep_hq", True)
+                and symbol == "NVDA" and bar_time is not None):
             sig = self._check_sweep_hq(symbol, bar, session, bar_time, bar_date)
             if sig:
                 return sig
 
         # ── Strategy 2: ORBFAIL_REGIME (all except GOOG) ──
-        if symbol != "GOOG" and session.orb_defined:
+        if (self.params.get("enable_orbfail", True)
+                and symbol != "GOOG" and session.orb_defined):
             sig = self._check_orbfail_regime(symbol, bar, bars, session)
             if sig:
                 return sig
 
         # ── Strategy 3: SWEEP_PRIMARY (all symbols, LONG only) ──
-        sig = self._check_sweep_primary(symbol, bar, session, bar_date)
-        if sig:
-            return sig
+        if self.params.get("enable_sweep_primary", True):
+            sig = self._check_sweep_primary(symbol, bar, session, bar_date)
+            if sig:
+                return sig
 
         return None
 
@@ -340,20 +378,23 @@ class EventDrivenStrategy(BaseStrategy):
         # PDL sweep: bar wicks below PDL AND closes back inside (>= PDL)
         if bar["low"] < session.prior_day_low and price >= session.prior_day_low:
             stop = bar["low"]               # sweep wick extreme
-            risk = abs(price - stop)
+            # Use expected fill (incl. slippage) so target is exactly 1R from fill,
+            # not from the close. Without this the effective R:R is ~0.5-0.7:1.
+            fill = price * (1 + ENTRY_SLIPPAGE)
+            risk = abs(fill - stop)
             if risk <= 0:
                 return None
-            target = price + risk           # Fixed +1R
+            target = fill + risk            # Fixed +1R from fill
 
             session.pdl_sweep_fired = True
-            self._enter_position(symbol, "sweep_hq", "long", price, stop, risk,
+            self._enter_position(symbol, "sweep_hq", "long", fill, stop, risk,
                                   target=target)
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.LONG,
                 strength=1.0, strategy_name=self.name,
                 metadata={
                     "strategy": "sweep_hq",
-                    "entry": round(price, 2),
+                    "entry": round(fill, 2),
                     "stop": round(stop, 2),
                     "target": round(target, 2),
                     "risk": round(risk, 2),
@@ -405,19 +446,21 @@ class EventDrivenStrategy(BaseStrategy):
         stop = session.orb_bo_extreme
         if stop == float("inf"):
             stop = bar["low"]   # edge case: no bars between BO and failure
-        risk = abs(price - stop)
+        # Use expected fill so 1R target check in exit is relative to actual fill.
+        fill = price * (1 + ENTRY_SLIPPAGE)
+        risk = abs(fill - stop)
         if risk <= 0:
             return None
 
         session.orb_fail_fired = True
-        self._enter_position(symbol, "orbfail_regime", "long", price, stop, risk,
-                              best_price=price)
+        self._enter_position(symbol, "orbfail_regime", "long", fill, stop, risk,
+                              best_price=fill)
         return SignalEvent(
             symbol=symbol, signal_type=SignalType.LONG,
             strength=1.0, strategy_name=self.name,
             metadata={
                 "strategy": "orbfail_regime",
-                "entry": round(price, 2),
+                "entry": round(fill, 2),
                 "stop": round(stop, 2),
                 "risk": round(risk, 2),
                 "orb_mid": round(orb_mid, 2),
@@ -447,6 +490,10 @@ class EventDrivenStrategy(BaseStrategy):
         # Phase 1: detect PDL sweep bar (set pending flag, do NOT fire yet)
         if not session.pdl_sweep_pending and not session.pdl_sweep_fired:
             if bar["low"] < session.prior_day_low and price >= session.prior_day_low:
+                # RVOL gate: above-average opening volume required
+                rvol_thr = self.params.get("rvol_threshold_sweep", 1.0)
+                if rvol_thr > 0 and self._daily_rvol.get(symbol, 1.0) < rvol_thr:
+                    return None
                 session.pdl_sweep_pending = True
                 session.pdl_sweep_bar_idx = bar_idx
                 session.pdl_sweep_extreme = bar["low"]
@@ -487,18 +534,19 @@ class EventDrivenStrategy(BaseStrategy):
             session.pdl_sweep_pending = False
             session.pdl_sweep_fired = True
             stop = session.pdl_sweep_extreme
-            risk = abs(price - stop)
+            fill = price * (1 + ENTRY_SLIPPAGE)
+            risk = abs(fill - stop)
             if risk <= 0:
                 return None
 
-            self._enter_position(symbol, "sweep_primary", "long", price, stop, risk)
+            self._enter_position(symbol, "sweep_primary", "long", fill, stop, risk)
             return SignalEvent(
                 symbol=symbol, signal_type=SignalType.LONG,
                 strength=0.5,   # Half position — 2/4 WF pass (marginal)
                 strategy_name=self.name,
                 metadata={
                     "strategy": "sweep_primary",
-                    "entry": round(price, 2),
+                    "entry": round(fill, 2),
                     "stop": round(stop, 2),
                     "risk": round(risk, 2),
                     "exit": "eod",
@@ -558,6 +606,7 @@ class EventDrivenStrategy(BaseStrategy):
         """SWEEP_HQ exit: Fixed +1R target or stop.
 
         Validated exit X3 (Fixed 1R) — best Sharpe (+0.899) for NVDA morning sweeps.
+        Fill at exact stop/target price (matches research script assumption).
         """
         direction = self._pos_direction[symbol]
         stop = self._pos_stop[symbol]
@@ -568,17 +617,17 @@ class EventDrivenStrategy(BaseStrategy):
         if direction == "long":
             if bar["low"] <= stop:
                 return self._emit_exit(symbol, "sweep_hq", direction,
-                                       bar["close"], entry, "stop")
+                                       stop, entry, "stop")
             if bar["high"] >= target:
                 return self._emit_exit(symbol, "sweep_hq", direction,
-                                       bar["close"], entry, "target_1r")
+                                       target, entry, "target_1r")
         else:
             if bar["high"] >= stop:
                 return self._emit_exit(symbol, "sweep_hq", direction,
-                                       bar["close"], entry, "stop")
+                                       stop, entry, "stop")
             if bar["low"] <= target:
                 return self._emit_exit(symbol, "sweep_hq", direction,
-                                       bar["close"], entry, "target_1r")
+                                       target, entry, "target_1r")
         return None
 
     def _exit_orbfail_regime(self, symbol: str, bar: dict, bars: list,
@@ -622,16 +671,16 @@ class EventDrivenStrategy(BaseStrategy):
             if bar["low"] <= stop:
                 reason = "trail" if partial_done else "stop"
                 return self._emit_exit(symbol, "orbfail_regime", direction,
-                                       bar["close"], entry, reason)
+                                       stop, entry, reason)
 
             # 2. 1R target reached → emit 50% close, activate ATR trail on rest
             if not partial_done and bar["high"] >= entry + risk:
                 self._pos_partial[symbol] = True
                 trail_stop = max(stop, entry + risk - atr_val)
                 self._pos_stop[symbol] = trail_stop
-                # Emit the partial close — risk manager reads partial_pct=0.5
+                # Emit the partial close at exactly 1R level
                 return self._emit_partial_exit(symbol, "orbfail_regime", direction,
-                                               bar["close"], entry)
+                                               entry + risk, entry)
 
             # 3. EOD fallback
             elif bar_time is not None and bar_time >= self._EOD_TIME:
@@ -651,14 +700,14 @@ class EventDrivenStrategy(BaseStrategy):
             if bar["high"] >= stop:
                 reason = "trail" if partial_done else "stop"
                 return self._emit_exit(symbol, "orbfail_regime", direction,
-                                       bar["close"], entry, reason)
+                                       stop, entry, reason)
 
             if not partial_done and bar["low"] <= entry - risk:
                 self._pos_partial[symbol] = True
                 trail_stop = min(stop, entry - risk + atr_val)
                 self._pos_stop[symbol] = trail_stop
                 return self._emit_partial_exit(symbol, "orbfail_regime", direction,
-                                               bar["close"], entry)
+                                               entry - risk, entry)
 
             elif bar_time is not None and bar_time >= self._EOD_TIME:
                 return self._emit_exit(symbol, "orbfail_regime", direction,
@@ -680,14 +729,14 @@ class EventDrivenStrategy(BaseStrategy):
         if direction == "long":
             if bar["low"] <= stop:
                 return self._emit_exit(symbol, "sweep_primary", direction,
-                                       bar["close"], entry, "stop")
+                                       stop, entry, "stop")
             if bar_time is not None and bar_time >= self._EOD_TIME:
                 return self._emit_exit(symbol, "sweep_primary", direction,
                                        bar["close"], entry, "eod")
         else:
             if bar["high"] >= stop:
                 return self._emit_exit(symbol, "sweep_primary", direction,
-                                       bar["close"], entry, "stop")
+                                       stop, entry, "stop")
             if bar_time is not None and bar_time >= self._EOD_TIME:
                 return self._emit_exit(symbol, "sweep_primary", direction,
                                        bar["close"], entry, "eod")
@@ -695,7 +744,12 @@ class EventDrivenStrategy(BaseStrategy):
 
     def _emit_exit(self, symbol: str, strategy: str, direction: str,
                    price: float, entry: float, reason: str) -> SignalEvent:
-        """Record P&L diagnostics, clean up state, return exit signal."""
+        """Record P&L diagnostics, clean up state, return exit signal.
+
+        `price` is the intended fill price (stop/target/close). Passed through
+        to SimulatedExecution via `exit_fill_price` metadata so fills match
+        the research scripts' assumption (exit at exact stop/target level).
+        """
         pnl_pct = ((price - entry) / entry * 100 if direction == "long"
                    else (entry - price) / entry * 100)
         if pnl_pct > 0:
@@ -710,6 +764,7 @@ class EventDrivenStrategy(BaseStrategy):
             metadata={
                 "exit_reason": reason, "strategy": strategy,
                 "exit_price": round(price, 2), "entry_price": round(entry, 2),
+                "exit_fill_price": round(price, 4),
             },
         )
 
@@ -719,6 +774,7 @@ class EventDrivenStrategy(BaseStrategy):
 
         Position remains active so ATR trail continues on the remaining 50%.
         Risk manager reads metadata['partial_pct'] = 0.5 and closes half.
+        `price` should be the 1R level (entry ± risk) to fill at exact target.
         """
         exit_type = SignalType.EXIT_LONG if direction == "long" else SignalType.EXIT_SHORT
         return SignalEvent(
@@ -730,6 +786,7 @@ class EventDrivenStrategy(BaseStrategy):
                 "exit_price": round(price, 2),
                 "entry_price": round(entry, 2),
                 "partial_pct": 0.5,
+                "exit_fill_price": round(price, 4),
             },
         )
 

@@ -230,7 +230,7 @@ class BacktestEngine:
                 for col in ["open", "high", "low", "close"]:
                     val = df[col].iloc[i]
                     deviation = abs(val - global_median) / global_median
-                    if deviation > 0.40:  # >40% from global median
+                    if deviation > 0.80:  # >80% from global median (40% was too tight for trending stocks)
                         mask[i] = False
                         print(f"  ⚠ Bad tick (global): {sym} @ {df.index[i]} — "
                               f"{col}={val:.2f} (global median={global_median:.2f}, "
@@ -635,13 +635,29 @@ class BacktestEngine:
             print(f"  Worst Trade:            {worst_pct:>+12.2f}%  (${worst_dollar:>+10,.2f})")
             print(f"  Closed P&L:            ${closed_pnl:>+13,.2f}")
 
-            print(f"\n  {'Symbol':<6} {'Dir':<6} {'Strat':<14} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
+            # Per-sub-strategy breakdown (only if multiple sub-strategies present)
+            if "strategy" in paired.columns:
+                sub_strategies = paired["strategy"].unique()
+                if len(sub_strategies) > 1 or (len(sub_strategies) == 1 and sub_strategies[0] != "event_driven"):
+                    print(f"\n  SUB-STRATEGY BREAKDOWN")
+                    print(f"  {'-'*68}")
+                    print(f"  {'Strategy':<18} {'N':>4} {'WR':>6} {'AvgPnL':>9} {'TotPnL':>10} {'WR%'}")
+                    print(f"  {'-'*68}")
+                    for strat_name, grp in paired.groupby("strategy"):
+                        n = len(grp)
+                        wr = grp["win"].mean()
+                        avg_pnl = grp["net_pnl"].mean()
+                        tot_pnl = grp["net_pnl"].sum()
+                        print(f"  {strat_name:<18} {n:>4} {wr:>6.1%} {avg_pnl:>+9.2f} {tot_pnl:>+10.2f}")
+                    print(f"  {'-'*68}")
+
+            print(f"\n  {'Symbol':<6} {'Dir':<6} {'Strat':<18} {'Entry':>10} {'Exit':>10} {'P&L%':>8} {'Net $':>10} {'Duration'}")
             print(f"  {'-'*88}")
             for _, t in paired.iterrows():
                 marker = "✓" if t["win"] else "✗"
-                strat = t.get("strategy", "?")[:12]
+                strat = t.get("strategy", "?")[:16]
                 print(
-                    f"  {t['symbol']:<6} {t['direction']:<6} {strat:<14} "
+                    f"  {t['symbol']:<6} {t['direction']:<6} {strat:<18} "
                     f"${t['entry_price']:>9,.2f} ${t['exit_price']:>9,.2f} "
                     f"{t['pnl_pct']:>+7.2f}% ${t['net_pnl']:>9,.2f} "
                     f"{t['duration']}  {marker}"
@@ -877,8 +893,8 @@ class BacktestEngine:
                 ts = pd.Timestamp(row["timestamp"])
                 if symbol in self._bar_data:
                     df = self._bar_data[symbol]
-                    df_idx = df.index.tz_localize(None) if df.index.tz else df.index
-                    ts_naive = ts.tz_localize(None) if ts.tzinfo else ts
+                    df_idx = pd.to_datetime(df.index, utc=True).tz_localize(None)
+                    ts_naive = ts.tz_convert('UTC').tz_localize(None) if ts.tzinfo else ts
                     idx = df_idx.get_indexer([ts_naive], method="nearest")[0]
                 else:
                     idx = 0
@@ -929,18 +945,18 @@ class BacktestEngine:
                 exit_idx = 0
                 if symbol in self._bar_data:
                     df = self._bar_data[symbol]
-                    df_idx = df.index.tz_localize(None) if df.index.tz else df.index
+                    df_idx = pd.to_datetime(df.index, utc=True).tz_localize(None)
 
                     try:
                         et = pd.Timestamp(t["entry_time"])
-                        et = et.tz_localize(None) if et.tzinfo else et
+                        et = et.tz_convert('UTC').tz_localize(None) if et.tzinfo else et
                         entry_idx = int(df_idx.get_indexer([et], method="nearest")[0])
                     except Exception:
                         entry_idx = 0
 
                     try:
                         xt = pd.Timestamp(t["exit_time"])
-                        xt = xt.tz_localize(None) if xt.tzinfo else xt
+                        xt = xt.tz_convert('UTC').tz_localize(None) if xt.tzinfo else xt
                         exit_idx = int(df_idx.get_indexer([xt], method="nearest")[0])
                     except Exception:
                         exit_idx = entry_idx + 1

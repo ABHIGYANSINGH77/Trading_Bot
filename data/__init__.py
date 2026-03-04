@@ -787,20 +787,24 @@ class DataManager:
         rolling_med = pd.Series(closes).rolling(10, center=True, min_periods=3).median()
         rolling_med = rolling_med.fillna(pd.Series(closes).expanding(min_periods=1).median())
 
-        # Check ALL columns against close median, not just close
+        # Check ALL columns against close median, not just close.
+        # Require at least 5 bad values before invalidating — single anomalous
+        # bars are common on earnings days and don't indicate corrupt data.
+        MIN_BAD = 5
         for col in ["open", "high", "low", "close"]:
             deviation = (pd.Series(df[col].values) - rolling_med).abs() / rolling_med
             bad = deviation > 0.15
-            if bad.any():
-                n_bad = bad.sum()
+            n_bad = int(bad.sum())
+            if n_bad >= MIN_BAD:
                 print(f"  ⚠ Cache for {symbol} has {n_bad} bad {col.upper()} values — re-fetching")
                 return None  # Signal to caller to delete cache and re-fetch
 
-        # Also check intrabar range
+        # Also check intrabar range — use 20% threshold for 15-min bars
+        # (earnings day bars can legitimately have 10-15% intraday range)
         intrabar = (df["high"] - df["low"]) / df["close"]
-        if (intrabar > 0.05).any():
-            n_wide = (intrabar > 0.05).sum()
-            print(f"  ⚠ Cache for {symbol} has {n_wide} bars with >5% range — re-fetching")
+        if (intrabar > 0.20).any():
+            n_wide = (intrabar > 0.20).sum()
+            print(f"  ⚠ Cache for {symbol} has {n_wide} bars with >20% range — re-fetching")
             return None
 
         return df

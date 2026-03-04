@@ -489,14 +489,25 @@ class RiskManager:
 
         order_id = f"{signal.strategy_name}_{symbol}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
 
+        # Pass through the strategy's intended fill price for stop/target exits.
+        # SimulatedExecution will use limit_price directly instead of bar close
+        # so that stop exits fill at -1R and target exits fill at +1R, matching
+        # the research scripts' assumption.
+        exit_fill_price = signal.metadata.get("exit_fill_price")
+
+        # Use sub-strategy name if available (e.g. "sweep_hq", "orbfail_regime",
+        # "sweep_primary") so paired trades in the report show per-sub-strategy.
+        strategy_name = signal.metadata.get("strategy", signal.strategy_name)
+
         return OrderEvent(
             symbol=symbol,
             order_type=OrderType.MARKET,
             side=side,
             quantity=qty_to_trade,
-            strategy_name=signal.strategy_name,
+            strategy_name=strategy_name,
             order_id=order_id,
             timestamp=self._latest_bar_time or datetime.utcnow(),
+            limit_price=exit_fill_price,
         )
 
     def _check_risk(self, order: OrderEvent, signal: SignalEvent, is_exit: bool = False) -> tuple:

@@ -326,7 +326,186 @@ class TradingBot:
         self._export_session_report()
 
     # ================================================================
-    #  MODE 2: PAPER - Live trading via IBKR TWS (delayed data, free)
+    #  MODE 2b: ALPACA — Live paper simulation via Alpaca IEX data
+    #  No IBKR needed. Uses SimulatedExecution for fills.
+    # ================================================================
+
+    def run_alpaca_simulate(self, poll_interval: int = 60, warmup_days: int = 30):
+        """Paper-trading simulation using Alpaca IEX 15m data + SimulatedExecution.
+
+        Phase 1: Fetch last warmup_days of 15m bars from Alpaca to warm up
+                 strategy state (ORB levels, RVOL deques, session history).
+        Phase 2: Poll Alpaca every poll_interval seconds for newly completed
+                 15m bars and run the full strategy → risk → simulated fill
+                 pipeline.  Outputs to backtest_report.json for the dashboard.
+        """
+        import requests
+        from zoneinfo import ZoneInfo
+        import time as _time
+
+        api_key = os.environ.get("ALPACA_API_KEY", "")
+        api_secret = os.environ.get("ALPACA_API_SECRET", "")
+        if not api_key or not api_secret:
+            logger.error("Set ALPACA_API_KEY and ALPACA_API_SECRET env vars before running.")
+            return
+
+        BASE = "https://data.alpaca.markets/v2/stocks"
+        HEADERS = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+        }
+        ET = ZoneInfo("America/New_York")
+
+        symbols = self._get_strategy_symbols()
+        bt_cfg = self.config.get("backtest", {})
+
+        self.execution = SimulatedExecution(
+            self.event_bus,
+            commission_per_share=bt_cfg.get("commission_per_share", 0.005),
+            min_commission=bt_cfg.get("min_commission", 1.0),
+            slippage_pct=bt_cfg.get("slippage_pct", 0.001),
+        )
+
+        def _fetch_bars(symbol: str, start_iso: str, end_iso: str, limit: int = 1000):
+            """Return list of bar dicts from Alpaca REST API."""
+            bars = []
+            params = {
+                "timeframe": "15Min",
+                "start": start_iso,
+                "end": end_iso,
+                "limit": limit,
+                "adjustment": "raw",
+                "feed": "iex",
+            }
+            while True:
+                resp = requests.get(f"{BASE}/{symbol}/bars", params=params,
+                                    headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                bars.extend(data.get("bars", []))
+                next_token = data.get("next_page_token")
+                if not next_token:
+                    break
+                params["page_token"] = next_token
+            return bars
+
+        # ── Phase 1: Historical warmup ──────────────────────────────
+        logger.info("")
+        logger.info("=" * 55)
+        logger.info("  PHASE 1: Alpaca historical warmup (%d days)" % warmup_days)
+        logger.info("=" * 55)
+
+        now_utc = datetime.utcnow()
+        warmup_start = (now_utc - timedelta(days=warmup_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        warmup_end   = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        for symbol in sorted(symbols):
+            try:
+                raw_bars = _fetch_bars(symbol, warmup_start, warmup_end)
+                logger.info(f"  {symbol}: {len(raw_bars)} warmup bars")
+                for b in raw_bars:
+                    ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")) \
+                                 .astimezone(ET)
+                    event = MarketDataEvent(
+                        symbol=symbol,
+                        open=b["o"], high=b["h"], low=b["l"], close=b["c"],
+                        volume=b["v"],
+                        bar_timestamp=ts,
+                        timestamp=ts,
+                    )
+                    self.event_bus.publish(event)
+                    self.event_bus.process_all()
+            except Exception as exc:
+                logger.error(f"  Warmup failed for {symbol}: {exc}")
+
+        self.portfolio.take_snapshot()
+        logger.info(f"  Strategy: {self.strategy.get_diagnostics()}")
+
+        # ── Phase 2: Live polling loop ──────────────────────────────
+        logger.info("")
+        logger.info("=" * 55)
+        logger.info("  PHASE 2: Live Alpaca simulation")
+        logger.info("=" * 55)
+        logger.info(f"  Polling every {poll_interval}s — Ctrl+C to stop.\n")
+
+        self._running = True
+        self._journal_active = True
+        self._session_start = datetime.now()
+
+        # Per-symbol: last bar timestamp we've already processed.
+        last_bar_ts: dict = {}
+
+        while self._running:
+            now_et = datetime.now(tz=ET)
+
+            # Outside market hours: sleep without processing
+            market_open  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+            if now_et.weekday() >= 5 or not (market_open <= now_et < market_close):
+                next_check = 300 if now_et.weekday() >= 5 else 60
+                logger.info(f"Outside market hours ({now_et.strftime('%H:%M ET')}). "
+                            f"Sleeping {next_check}s...")
+                _time.sleep(next_check)
+                continue
+
+            # Fetch last 90 min of bars to catch any we might have missed
+            fetch_start = (datetime.utcnow() - timedelta(minutes=90)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            fetch_end   = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            new_bars_count = 0
+            for symbol in sorted(symbols):
+                try:
+                    raw_bars = _fetch_bars(symbol, fetch_start, fetch_end, limit=10)
+                    for b in raw_bars:
+                        ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")) \
+                                     .astimezone(ET)
+                        # Skip already-processed bars or bars that haven't closed yet
+                        # A 15m bar with timestamp T is complete once T + 15min <= now
+                        bar_close_time = ts.replace(tzinfo=None) + timedelta(minutes=15)
+                        now_naive = now_et.replace(tzinfo=None)
+                        if ts == last_bar_ts.get(symbol):
+                            continue
+                        if bar_close_time > now_naive:
+                            continue   # bar not yet complete
+
+                        event = MarketDataEvent(
+                            symbol=symbol,
+                            open=b["o"], high=b["h"], low=b["l"], close=b["c"],
+                            volume=b["v"],
+                            bar_timestamp=ts,
+                            timestamp=ts,
+                        )
+                        self.event_bus.publish(event)
+                        self.event_bus.process_all()
+                        last_bar_ts[symbol] = ts
+                        new_bars_count += 1
+
+                except Exception as exc:
+                    logger.warning(f"  {symbol} fetch error: {exc}")
+
+            if new_bars_count:
+                logger.info(f"[{now_et.strftime('%H:%M:%S ET')}] "
+                            f"Processed {new_bars_count} new bars  |  "
+                            f"Portfolio: ${self.portfolio.total_value:,.2f}")
+                # Export report every time we have new data (dashboard auto-refreshes)
+                try:
+                    self._export_session_report()
+                except Exception:
+                    pass
+
+            try:
+                _time.sleep(poll_interval)
+            except KeyboardInterrupt:
+                break
+
+        self._journal_active = False
+        self._print_session_summary()
+        self._export_session_report()
+
+    # ================================================================
+    #  MODE 3: PAPER - Live trading via IBKR TWS (delayed data, free)
     # ================================================================
 
     def run_paper(self, poll_interval: int = 10, warmup_days: int = 90):
@@ -388,151 +567,183 @@ class TradingBot:
                 contracts[symbol] = c
                 logger.info(f"Qualified contract: {symbol} -> {c}")
 
-            # --- Phase 1: Warmup with IBKR historical data ---
+            # --- Phase 1: Warmup with IBKR 15m historical bars ---
+            # event_driven needs 15m OHLCV bars (not daily) to build ORB, RVOL,
+            # PDL levels, and VWAP correctly from the first live bar onward.
             logger.info("")
             logger.info("=" * 50)
-            logger.info("  PHASE 1: Historical warmup via IBKR")
+            logger.info(f"  PHASE 1: 15m warmup via IBKR ({warmup_days} days)")
             logger.info("=" * 50)
 
+            show = "MIDPOINT" if asset_type == "FX" else "TRADES"
             for symbol in sorted(symbols):
                 c = contracts[symbol]
-                logger.info(f"  Fetching history for {symbol}...")
-
+                logger.info(f"  Fetching 15m history for {symbol}...")
                 try:
                     bars = ib.reqHistoricalData(
                         c,
                         endDateTime="",
                         durationStr=f"{warmup_days} D",
-                        barSizeSetting="1 day",
-                        whatToShow="MIDPOINT" if asset_type == "FX" else "TRADES",
+                        barSizeSetting="15 mins",
+                        whatToShow=show,
                         useRTH=True,
-                        formatDate=1,
+                        formatDate=2,   # formatDate=2 → datetime objects
                     )
-
-                    if not bars:
-                        logger.warning(f"  No historical data for {symbol}, trying ADJUSTED_LAST...")
-                        bars = ib.reqHistoricalData(
-                            c, endDateTime="", durationStr=f"{warmup_days} D",
-                            barSizeSetting="1 day", whatToShow="ADJUSTED_LAST",
-                            useRTH=True, formatDate=1,
-                        )
-
                     if bars:
-                        logger.info(f"  {symbol}: {len(bars)} bars loaded")
+                        logger.info(f"  {symbol}: {len(bars)} 15m bars loaded")
                         for bar in bars:
+                            bar_ts = bar.date if isinstance(bar.date, datetime) \
+                                     else datetime.strptime(str(bar.date), "%Y%m%d %H:%M:%S")
                             event = MarketDataEvent(
                                 symbol=symbol,
                                 open=bar.open, high=bar.high,
                                 low=bar.low, close=bar.close,
-                                volume=getattr(bar, 'volume', 0),
-                                bar_timestamp=bar.date if hasattr(bar.date, 'timestamp') else datetime.now(),
-                                timestamp=bar.date if hasattr(bar.date, 'timestamp') else datetime.now(),
+                                volume=getattr(bar, "volume", 0),
+                                bar_timestamp=bar_ts,
+                                timestamp=bar_ts,
                             )
                             self.event_bus.publish(event)
                             self.event_bus.process_all()
                     else:
-                        logger.error(f"  No data at all for {symbol}. Check if market was open.")
-
+                        logger.warning(f"  No 15m data for {symbol} — strategy state may be cold")
+                    # IBKR rate-limits historical requests; brief pause between symbols
+                    ib.sleep(1)
                 except Exception as e:
-                    logger.error(f"  Historical fetch failed for {symbol}: {e}")
+                    logger.error(f"  Warmup failed for {symbol}: {e}")
 
             self.portfolio.take_snapshot()
             logger.info(f"\n  Strategy state: {self.strategy.get_diagnostics()}")
 
-            # --- Phase 2: Live delayed polling ---
+            # --- Phase 2: Live 15m bar polling ---
+            # Poll reqHistoricalData every poll_interval seconds for newly
+            # completed 15m bars. IBKR delayed data (type 3) is ~5 min behind,
+            # which is fine — our strategy fires on bar-close, not sub-minute.
             logger.info("")
             logger.info("=" * 50)
-            logger.info("  PHASE 2: Live paper trading (delayed data)")
+            logger.info("  PHASE 2: Live 15m paper trading (delayed IBKR)")
             logger.info("=" * 50)
-
-            # Request market data snapshots for each symbol
-            tickers = {}
-            for symbol in symbols:
-                c = contracts[symbol]
-                ticker = ib.reqMktData(c, "", False, False)
-                tickers[symbol] = ticker
-                logger.info(f"  Requested delayed data for {symbol}")
-
-            # Give IBKR a moment to start sending data
-            ib.sleep(2)
+            logger.info(f"  Polling every {poll_interval}s. Ctrl+C to stop.\n")
 
             self._running = True
             self._journal_active = True
             self._session_start = datetime.now()
-            logger.info(f"\nPaper trading live. Polling every {poll_interval}s. Ctrl+C to stop.\n")
+
+            # ── Session log: persistent per-bar + per-trade record ──────
+            import json as _json
+            session_dir = Path("./paper_sessions")
+            session_dir.mkdir(exist_ok=True)
+            session_tag = self._session_start.strftime("%Y%m%d_%H%M%S")
+            session_log_path = session_dir / f"session_{session_tag}.jsonl"
+            logger.info(f"  Session log: {session_log_path}")
+
+            def _log_to_session(record: dict):
+                """Append one JSON line to the session log file."""
+                try:
+                    with open(session_log_path, "a") as _lf:
+                        _lf.write(_json.dumps(record, default=str) + "\n")
+                except Exception:
+                    pass
+
+            # Subscribe fills to session log
+            def _on_fill_session(event):
+                _log_to_session({
+                    "type": "fill",
+                    "ts": str(datetime.now()),
+                    "symbol": event.symbol,
+                    "side": event.side.value,
+                    "qty": int(event.quantity),
+                    "price": float(event.fill_price),
+                    "strategy": event.strategy_name or "",
+                })
+            self.event_bus.subscribe(EventType.FILL, _on_fill_session)
+
+            # Per-symbol: last processed bar timestamp (avoids re-processing)
+            last_bar_ts: dict = {}
             poll_count = 0
-            last_prices = {}
 
             while self._running:
                 poll_count += 1
                 now = datetime.now()
-
-                # Let IBKR process incoming data
-                ib.sleep(0.5)
+                new_bars_this_cycle = 0
 
                 for symbol in sorted(symbols):
-                    ticker = tickers[symbol]
+                    try:
+                        # Fetch last ~45 min of 15m bars to catch any missed bars
+                        hist = ib.reqHistoricalData(
+                            contracts[symbol],
+                            endDateTime="",
+                            durationStr="3600 S",   # last 60 min → 4 bars max
+                            barSizeSetting="15 mins",
+                            whatToShow=show,
+                            useRTH=True,
+                            formatDate=2,
+                        )
+                        ib.sleep(0.5)   # be kind to IBKR rate limits
 
-                    # Get best available price from delayed snapshot
-                    price = None
-                    if ticker.last and ticker.last > 0:
-                        price = ticker.last
-                    elif ticker.close and ticker.close > 0:
-                        price = ticker.close
-                    elif ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0:
-                        price = (ticker.bid + ticker.ask) / 2.0
+                        for bar in (hist or []):
+                            bar_ts = bar.date if isinstance(bar.date, datetime) \
+                                     else datetime.strptime(str(bar.date), "%Y%m%d %H:%M:%S")
 
-                    if price is None or price <= 0:
-                        continue
+                            # Skip bars we've already processed
+                            if bar_ts <= last_bar_ts.get(symbol, datetime.min):
+                                continue
+                            # Skip a bar that hasn't closed yet (its end time > now)
+                            if bar_ts + timedelta(minutes=15) > now:
+                                continue
 
-                    # Skip if unchanged
-                    prev = last_prices.get(symbol)
-                    if prev is not None and abs(price - prev) < 0.001:
-                        continue
+                            event = MarketDataEvent(
+                                symbol=symbol,
+                                open=bar.open, high=bar.high,
+                                low=bar.low, close=bar.close,
+                                volume=getattr(bar, "volume", 0),
+                                bar_timestamp=bar_ts,
+                                timestamp=bar_ts,
+                            )
+                            self.event_bus.publish(event)
+                            self.event_bus.process_all()
+                            last_bar_ts[symbol] = bar_ts
+                            new_bars_this_cycle += 1
 
-                    last_prices[symbol] = price
+                            # Add to in-memory journal (used by _export_session_report)
+                            self._journal_bar(symbol, bar.open, bar.high,
+                                              bar.low, bar.close,
+                                              getattr(bar, "volume", 0))
 
-                    high = ticker.high if ticker.high and ticker.high > 0 else price
-                    low = ticker.low if ticker.low and ticker.low > 0 else price
-                    opn = ticker.open if ticker.open and ticker.open > 0 else price
-                    vol = ticker.volume if ticker.volume else 0
+                            # Log bar to session file
+                            _log_to_session({
+                                "type": "bar",
+                                "ts": str(bar_ts),
+                                "symbol": symbol,
+                                "open": bar.open, "high": bar.high,
+                                "low": bar.low, "close": bar.close,
+                                "volume": getattr(bar, "volume", 0),
+                            })
 
-                    event = MarketDataEvent(
-                        symbol=symbol,
-                        open=opn, high=high, low=low, close=price,
-                        volume=vol, bar_timestamp=now, timestamp=now,
+                    except Exception as e:
+                        logger.warning(f"  {symbol} bar fetch error: {e}")
+
+                if new_bars_this_cycle:
+                    self.portfolio.take_snapshot(now)
+                    pos_parts = [
+                        f"{s}:{p.quantity}@${p.current_price:.2f}"
+                        f"({p.unrealized_pnl:+,.0f})"
+                        for s, p in self.portfolio.active_positions.items()
+                    ]
+                    logger.info(
+                        f"[{now.strftime('%H:%M:%S')} #{poll_count}] "
+                        f"{new_bars_this_cycle} new bar(s) | "
+                        f"Portfolio: ${self.portfolio.total_value:,.2f} "
+                        f"({self.portfolio.total_return:+.2%}) | "
+                        f"Pos: [{', '.join(pos_parts) or 'flat'}]"
                     )
-                    self.event_bus.publish(event)
-                    self._journal_bar(symbol, opn, high, low, price, vol)
+                    # Export dashboard report whenever we have new data
+                    try:
+                        self._export_session_report()
+                    except Exception:
+                        pass
 
-                # Process all events
-                self.event_bus.process_all()
-                self.portfolio.take_snapshot(now)
-
-                # Log status
-                risk_status = self.risk_manager.get_status()
-                price_parts = [f"{s}: ${p:.2f}" for s, p in sorted(last_prices.items())]
-                pos_parts = [
-                    f"{s}:{p.quantity}@${p.current_price:.2f}(${p.unrealized_pnl:+,.2f})"
-                    for s, p in self.portfolio.active_positions.items()
-                ]
-
-                logger.info(
-                    f"[#{poll_count:>4}] {' | '.join(price_parts)} | "
-                    f"Value: ${self.portfolio.total_value:,.2f} ({self.portfolio.total_return:+.2%}) | "
-                    f"Pos: [{', '.join(pos_parts) or 'flat'}]"
-                )
-
-                diag = self.strategy.get_diagnostics()
-                if isinstance(diag, dict):
-                    # BOS strategy diagnostics
-                    self._log_bos_diagnostics()
-
-                # Wait
                 try:
-                    remaining = poll_interval - 0.5  # account for ib.sleep above
-                    if remaining > 0:
-                        time.sleep(remaining)
+                    time.sleep(poll_interval)
                 except KeyboardInterrupt:
                     break
 
@@ -711,30 +922,37 @@ class TradingBot:
                 })
 
         session_type = "paper" if self.execution.__class__.__name__ == "IBKRExecution" else "simulate"
+        metrics = self.portfolio.calculate_metrics()
         report = {
             "meta": {
                 "symbols": symbols,
-                "interval": "live",
+                "interval": "15m",
                 "start": str(self._session_start),
                 "end": str(datetime.now()),
                 "strategies": [self.strategy_name],
                 "session_type": session_type,
                 "generated_at": datetime.now().isoformat(),
             },
-            "metrics": self.portfolio.calculate_metrics(),
+            "metrics": metrics,
             "bars": bars_by_symbol,
             "signals": signals_with_idx,
             "paired_trades": paired,
             "equity_curve": equity_curve,
         }
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"./{session_type}_report_{timestamp}.json"
-        with open(path, "w") as f:
+        # 1. Always overwrite backtest_report.json so the web dashboard picks it up
+        with open("./backtest_report.json", "w") as f:
             json.dump(report, f, indent=2, default=str)
 
-        print(f"\n  📊 Session report saved: {path}")
-        print(f"  To visualize: python visualizer.py --report {path}")
+        # 2. Save a timestamped copy to paper_sessions/ for permanent record
+        session_dir = Path("./paper_sessions")
+        session_dir.mkdir(exist_ok=True)
+        dated_path = session_dir / f"{session_type}_{self._session_start.strftime('%Y%m%d_%H%M%S')}.json"
+        with open(dated_path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+
+        print(f"\n  Session report: {dated_path}")
+        print(f"  Dashboard copy: ./backtest_report.json  (open python web_app.py)")
         print()
 
     def stop(self):
@@ -927,6 +1145,42 @@ def paper(strategy, interval, warmup, config):
     signal.signal(signal.SIGTERM, handle_sig)
 
     bot.run_paper(poll_interval=interval, warmup_days=warmup)
+
+
+@cli.command()
+@click.option("--strategy", "-s", required=True, help="Strategy name")
+@click.option("--interval", "-i", default=60,
+              help="Poll interval in seconds (default: 60)")
+@click.option("--warmup", "-w", default=30,
+              help="Warmup days of 15m Alpaca history (default: 30)")
+@click.option("--config", "-c", default=None, help="Config file path")
+def alpaca(strategy, interval, warmup, config):
+    """Live paper simulation via Alpaca IEX 15m data — no IBKR needed.
+
+    \b
+    Warm up with 15m Alpaca historical bars, then poll live bars each interval.
+    Uses SimulatedExecution (no real orders placed on the Alpaca account).
+    Outputs backtest_report.json every cycle — open the web dashboard to watch live.
+
+    \b
+    Set env vars before running:
+        export ALPACA_API_KEY=<your_key>
+        export ALPACA_API_SECRET=<your_secret>
+        python main.py alpaca -s event_driven
+
+    \b
+    Then in another terminal:
+        python web_app.py          # http://localhost:8050 auto-refreshes every 30s
+    """
+    cfg = load_config(config)
+    bot = TradingBot(cfg, strategy)
+
+    def handle_sig(signum, frame):
+        bot.stop()
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    bot.run_alpaca_simulate(poll_interval=interval, warmup_days=warmup)
 
 
 if __name__ == "__main__":
