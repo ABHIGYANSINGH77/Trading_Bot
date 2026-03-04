@@ -37,6 +37,14 @@ st.markdown(f"""
   .main{{background:{BG};}}
   .block-container{{padding:1.2rem 2rem 2rem 2rem;}}
   [data-testid="stSidebar"]{{background:#0d1420;border-right:1px solid {BORD};}}
+  [data-testid="collapsedControl"]{{
+    background:{CARD} !important;
+    border:1px solid {BORD} !important;
+    border-radius:0 4px 4px 0 !important;
+    opacity:1 !important;
+    visibility:visible !important;
+  }}
+  [data-testid="collapsedControl"] svg{{stroke:{AMB} !important;opacity:1 !important;}}
   .pg-title{{font-size:1.5rem;font-weight:700;line-height:1.2;margin-bottom:0.15rem;
              letter-spacing:-.01em;}}
   .pg-sub{{font-size:0.72rem;color:{MUTED};margin-bottom:.9rem;
