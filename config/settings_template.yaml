@@ -1,6 +1,5 @@
 
-# ── Trading Bot — Settings Template ──────────────────────────────────────────
-#
+# Trading Bot — Settings Template 
 # Copy this file to config/settings.yaml and fill in your values.
 # config/settings.yaml is gitignored and never committed.
 #
@@ -14,7 +13,6 @@
 #
 # For IBKR paper trading (requires TWS/IB Gateway running locally):
 #   python3 main.py paper -s event_driven -i 15m
-# ─────────────────────────────────────────────────────────────────────────────
 
 broker:
   host: "127.0.0.1"
@@ -61,7 +59,7 @@ backtest:
 
 strategies:
   event_driven:
-    # ── Symbol universe ──────────────────────────────────────────────────────
+    # ---- Symbol universe
     symbols:
       - "AAPL"
       - "NVDA"
@@ -74,19 +72,19 @@ strategies:
       - "AVGO"
       - "NFLX"
 
-    # ── SWEEP_HQ (Session Sweep + Rejection — NVDA only, 4/4 WF pass) ────────
+    # ---- SWEEP_HQ (Session Sweep + Rejection - NVDA only, 4/4 WF pass)
     sweep_hq_enabled: true
 
-    # ── ORBFAIL_REGIME (ORB Failure Fade — gap-up days, 4/4 WF pass) ─────────
+    # ---- ORBFAIL_REGIME (ORB Failure Fade - gap-up days, 4/4 WF pass)
     orbfail_enabled: true
     gap_threshold: 0.002             # minimum gap % to qualify (default 0.2%)
     fail_window: 6                   # bars after ORB BO to wait for failure
 
-    # ── SWEEP_PRIMARY (PDL long + prior_up + near_extreme, 2/4 MARGINAL) ──────
+    # ---- SWEEP_PRIMARY (PDL long + prior_up + near_extreme, 2/4 MARGINAL)
     sweep_primary_enabled: true
     rvol_threshold_sweep: 1.0        # min relative volume for SWEEP_PRIMARY
 
-    # ── Shared risk ──────────────────────────────────────────────────────────
+    # ---- Shared risk
     orb_minutes: 15                  # opening range = first 15-min bar
     atr_period: 14
 
