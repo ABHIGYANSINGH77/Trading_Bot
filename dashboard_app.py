@@ -37,14 +37,6 @@ st.markdown(f"""
   .main{{background:{BG};}}
   .block-container{{padding:1.2rem 2rem 2rem 2rem;}}
   [data-testid="stSidebar"]{{background:#0d1420;border-right:1px solid {BORD};}}
-  [data-testid="collapsedControl"]{{
-    background:{CARD} !important;
-    border:1px solid {BORD} !important;
-    border-radius:0 4px 4px 0 !important;
-    opacity:1 !important;
-    visibility:visible !important;
-  }}
-  [data-testid="collapsedControl"] svg{{stroke:{AMB} !important;opacity:1 !important;}}
   .pg-title{{font-size:1.5rem;font-weight:700;line-height:1.2;margin-bottom:0.15rem;
              letter-spacing:-.01em;}}
   .pg-sub{{font-size:0.72rem;color:{MUTED};margin-bottom:.9rem;
@@ -65,7 +57,24 @@ st.markdown(f"""
   .sc-h{{font-size:0.9rem;font-weight:700;color:{AMB};margin-bottom:0.5rem;}}
   .sc-r{{font-size:0.73rem;margin:0.2rem 0;line-height:1.5;}}
   .sc-k{{color:{MUTED};}}
-  #MainMenu,footer,header{{visibility:hidden;}}
+  #MainMenu{{visibility:hidden;}}
+  footer{{visibility:hidden;}}
+  header{{visibility:hidden;}}
+  [data-testid="collapsedControl"]{{
+    visibility:visible !important;
+    background:{CARD} !important;
+    border:1px solid {BORD} !important;
+    border-radius:0 6px 6px 0 !important;
+  }}
+  [data-testid="collapsedControl"] button{{
+    visibility:visible !important;
+    color:{AMB} !important;
+  }}
+  [data-testid="collapsedControl"] svg{{
+    visibility:visible !important;
+    fill:{AMB} !important;
+    stroke:{AMB} !important;
+  }}
 </style>
 """, unsafe_allow_html=True)
 
