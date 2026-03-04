@@ -57,10 +57,9 @@ st.markdown(f"""
   .sc-h{{font-size:0.9rem;font-weight:700;color:{AMB};margin-bottom:0.5rem;}}
   .sc-r{{font-size:0.73rem;margin:0.2rem 0;line-height:1.5;}}
   .sc-k{{color:{MUTED};}}
-  #MainMenu{{visibility:hidden;}}
-  footer{{visibility:hidden;}}
-  [data-testid="stToolbar"]{{display:none !important;}}
-  [data-testid="stDecoration"]{{display:none !important;}}
+  #MainMenu,footer,header{{visibility:hidden;}}
+  [data-testid="stSidebarCollapseButton"]{{display:none !important;}}
+  [data-testid="stSidebarHeader"] button{{display:none !important;}}
 </style>
 """, unsafe_allow_html=True)
 
