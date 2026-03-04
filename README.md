@@ -5,7 +5,7 @@ Implements a full quantitative pipeline: **hypothesis → statistical edge testi
 
 Built as a portfolio project targeting quantitative trader / quant researcher roles at proprietary trading firms (SIG, Optiver, Flow Traders).
 
-**Live dashboard:** [share.streamlit.io/ABHIGYANSINGH77/Trading_Bot](https://abhigyansingh77-trading-bot-dashboard-app-8s77bm.streamlit.app/)
+**Live dashboard:** [QuantEdge](https://quantedge.streamlit.app//)
 
 ---
 
